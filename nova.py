@@ -13,7 +13,7 @@ import re
 from typing import Optional
 
 # ----------------- CONFIGURATION -----------------
-TOKEN = "MTQ3OTA4MDA4MTAwMjMzNjM3MQ.GR6D92.sq3TfpvNVFkjCoH1teX7FQJODkejtjBlCsF5CU"
+TOKEN = ""
 NODE_NAME = "TEMPEST NODE"
 HOST_IP = "YOUR_SERVER_PUBLIC_IP"
 DB_PATH = "tempest_vms.db"
