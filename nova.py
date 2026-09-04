@@ -14,7 +14,7 @@ from typing import Optional
 # ----------------- CONFIGURATION -----------------
 TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
 NODE_NAME = "TEMPEST NODE"
-HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Replace with public IP/Domain
+HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Replace with node IP or public hostname
 DB_PATH = "tempest_vms.db"
 
 # Main Owner & Server Admin ID (Full Bypass + Reactions)
@@ -171,85 +171,64 @@ def launch_vm_container(owner_id: int, ram: str, cpu: str, disk: str, vnc_port: 
     )
     return container.id
 
-def execute_tmate_session(container_name: str) -> str:
+def execute_shhx_session(container_name: str) -> str:
     container = docker_client.containers.get(container_name)
     
-    # 1. Terminate old tmate sessions and stale sockets
-    container.exec_run("sh -c 'pkill -9 tmate; rm -f /tmp/tmate.sock'")
+    # 1. Kill old sessions and wipe logs
+    container.exec_run("sh -c 'pkill -9 shhx; pkill -9 shh; rm -f /tmp/shhx.log'")
 
-    # 2. Check if tmate binary exists
-    check = container.exec_run("sh -c 'command -v tmate'")
+    # 2. Check and install shhx standalone binary if missing
+    check = container.exec_run("sh -c 'command -v shhx'")
     if check.exit_code != 0:
-        # Pull static binary directly (bypasses broken APK mirror endpoints)
-        download_script = """
+        install_script = """
         ARCH=$(uname -m)
+        DL_URL=""
         if [ "$ARCH" = "x86_64" ]; then
-            URL="https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz"
+            DL_URL="https://github.com/antoniomika/shhx/releases/latest/download/shhx_linux_amd64"
         elif [ "$ARCH" = "aarch64" ]; then
-            URL="https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-arm64v8.tar.xz"
-        else
-            echo "Unsupported architecture: $ARCH" && exit 1
+            DL_URL="https://github.com/antoniomika/shhx/releases/latest/download/shhx_linux_arm64"
         fi
 
-        mkdir -p /tmp/tmate_dl
-        if command -v curl >/dev/null 2>&1; then
-            curl -k -sL "$URL" -o /tmp/tmate_dl/tmate.tar.xz
-        elif command -v wget >/dev/null 2>&1; then
-            wget --no-check-certificate -q "$URL" -O /tmp/tmate_dl/tmate.tar.xz
-        else
-            echo "No download tool found" && exit 1
-        fi
-
-        tar -xJf /tmp/tmate_dl/tmate.tar.xz -C /tmp/tmate_dl --strip-components=1 2>/dev/null || \
-        tar -xf /tmp/tmate_dl/tmate.tar.xz -C /tmp/tmate_dl --strip-components=1 2>/dev/null
-
-        if [ -f /tmp/tmate_dl/tmate ]; then
-            mv /tmp/tmate_dl/tmate /usr/bin/tmate || mv /tmp/tmate_dl/tmate /usr/local/bin/tmate
-            chmod +x /usr/bin/tmate /usr/local/bin/tmate 2>/dev/null
-            rm -rf /tmp/tmate_dl
-            exit 0
-        else
-            exit 1
+        if [ -n "$DL_URL" ]; then
+            if command -v curl >/dev/null 2>&1; then
+                curl -k -fsSL "$DL_URL" -o /usr/local/bin/shhx
+            elif command -v wget >/dev/null 2>&1; then
+                wget --no-check-certificate -qO /usr/local/bin/shhx "$DL_URL"
+            fi
+            chmod +x /usr/local/bin/shhx 2>/dev/null
         fi
         """
-        dl_res = container.exec_run(f"sh -c '{download_script}'")
+        container.exec_run(f"sh -c '{install_script}'")
 
-        check = container.exec_run("sh -c 'command -v tmate'")
-        if check.exit_code != 0:
-            apk_fallback = container.exec_run("sh -c 'apk add --no-cache --timeout 15 tmate 2>&1'")
-            check = container.exec_run("sh -c 'command -v tmate'")
-            if check.exit_code != 0:
-                err_msg = dl_res.output.decode('utf-8', errors='ignore') + " | " + apk_fallback.output.decode('utf-8', errors='ignore')
-                raise RuntimeError(f"Could not setup tmate: {err_msg[:140]}")
+    # Double verify binary exists
+    check = container.exec_run("sh -c 'command -v shhx'")
+    if check.exit_code != 0:
+        raise RuntimeError("Failed to download and configure shhx binary.")
 
-    # 3. Launch tmate in background with dedicated socket
-    launch_res = container.exec_run("sh -c 'tmate -S /tmp/tmate.sock -F new-session -d'")
-    if launch_res.exit_code != 0:
-        raise RuntimeError("Failed to spawn background tmate session.")
+    # 3. Launch shhx daemon in background logging to /tmp/shhx.log
+    container.exec_run("sh -c 'nohup shhx > /tmp/shhx.log 2>&1 &'")
 
-    # 4. Wait for tmate connection to initialize
-    ready = False
-    for _ in range(15):
-        w = container.exec_run("sh -c 'tmate -S /tmp/tmate.sock wait tmate-ready'")
-        if w.exit_code == 0:
-            ready = True
-            break
+    # 4. Parse tunnel connection string from the log output (up to 12s)
+    access_info = None
+    for _ in range(12):
         time.sleep(1)
+        log_res = container.exec_run("sh -c 'cat /tmp/shhx.log 2>/dev/null'")
+        logs = log_res.output.decode("utf-8", errors="ignore")
+        
+        # shhx produces SSH/Web connections like 'ssh ...@shhx.app' or direct URLs
+        lines = [line.strip() for line in logs.splitlines() if line.strip()]
+        for line in lines:
+            if "ssh " in line.lower() or "http" in line.lower():
+                access_info = "\n".join(lines[-2:]) if len(lines) >= 2 else line
+                break
+        if access_info:
+            break
 
-    if not ready:
-        raise RuntimeError("Tmate connection handshake timed out.")
+    if not access_info:
+        log_sample = logs[-120:] if 'logs' in locals() else 'No log output'
+        raise RuntimeError(f"shhx failed to output relay string: {log_sample}")
 
-    # 5. Read SSH and Web connection endpoints
-    res_ssh = container.exec_run("sh -c \"tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'\"")
-    ssh_cmd = res_ssh.output.decode("utf-8", errors="ignore").strip()
-
-    res_web = container.exec_run("sh -c \"tmate -S /tmp/tmate.sock display -p '#{tmate_web}'\"")
-    web_cmd = res_web.output.decode("utf-8", errors="ignore").strip()
-
-    if not ssh_cmd or "error" in ssh_cmd.lower():
-        raise RuntimeError(f"Could not retrieve SSH bridge string: {ssh_cmd}")
-
-    return f"{E_ARROW} **Direct SSH:** `{ssh_cmd}`\n{E_ARROW} **Web Shell:** {web_cmd}"
+    return f"{E_ARROW} **Connection Information:**\n```{access_info}```"
 
 def get_container_stats(container_name: str):
     try:
@@ -326,11 +305,12 @@ class VMControlView(discord.ui.View):
         super().__init__(timeout=None)
         self.owner_id = owner_id
         
-        self.ssh_button.custom_id = f"nova_ssh_{self.owner_id}"
+        self.ssh_button.custom_id = f"nova_shhx_{self.owner_id}"
         self.view_keys_button.custom_id = f"nova_keys_{self.owner_id}"
         self.reinstall_button.custom_id = f"nova_reinstall_{self.owner_id}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Full bypass for Main Owner and configured admins
         user_is_admin = await is_admin(interaction.user.id)
         if interaction.user.id == self.owner_id or user_is_admin:
             return True
@@ -342,27 +322,27 @@ class VMControlView(discord.ui.View):
         )
         return False
 
-    @discord.ui.button(label="Generate SSH (Tmate)", style=discord.ButtonStyle.primary, emoji="⚡")
+    @discord.ui.button(label="Generate SSH (SHHX)", style=discord.ButtonStyle.primary, emoji="⚡")
     async def ssh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         container_name = f"nova-vm-{self.owner_id}"
         
         try:
             loop = asyncio.get_running_loop()
-            tmate_info = await loop.run_in_executor(None, execute_tmate_session, container_name)
+            shhx_info = await loop.run_in_executor(None, execute_shhx_session, container_name)
             
             embed = discord.Embed(
-                title=f"{E_LIGHTNING} {NODE_NAME} • Private Terminal Bridge",
-                description=f"{E_STAR} Dedicated Tmate bridge generated for `{container_name}`.\n{E_WARN} *Any previous sessions have been killed.*",
+                title=f"{E_LIGHTNING} {NODE_NAME} • Private Terminal Bridge (SHHX)",
+                description=f"{E_STAR} Ephemeral bridge generated for `{container_name}`.\n{E_WARN} *Any previous sessions have been killed.*",
                 color=0x5865F2,
                 timestamp=datetime.datetime.now(datetime.timezone.utc)
             )
-            embed.add_field(name=f"{E_GEAR} Ephemeral Shell Access", value=tmate_info, inline=False)
+            embed.add_field(name=f"{E_GEAR} Shell Relay Access", value=shhx_info, inline=False)
             embed.set_footer(text=f"{NODE_NAME} • Secure Console Bridge", icon_url=interaction.client.user.display_avatar.url)
             
             try:
                 await interaction.user.send(embed=embed)
-                await interaction.followup.send(f"{E_CHECK} {E_YES} Tmate terminal access string delivered to your DMs.", ephemeral=True)
+                await interaction.followup.send(f"{E_CHECK} {E_YES} SHHX access string delivered directly to your DMs.", ephemeral=True)
             except discord.Forbidden:
                 await interaction.followup.send(f"{E_WARN} DM delivery failed! Please enable direct messages in your privacy settings.", ephemeral=True)
         except Exception as e:
