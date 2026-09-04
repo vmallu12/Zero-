@@ -14,7 +14,7 @@ from typing import Optional
 # ----------------- CONFIGURATION -----------------
 TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
 NODE_NAME = "TEMPEST NODE"
-HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Replace with node IP or domain
+HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Replace with public IP/Domain
 DB_PATH = "tempest_vms.db"
 
 # Main Owner & Server Admin ID (Full Bypass + Reactions)
@@ -178,7 +178,7 @@ def execute_tmate_session(container_name: str) -> str:
     container.exec_run("pkill -9 tmate")
     container.exec_run("rm -f /tmp/tmate.sock")
 
-    # 2. Check if tmate exists inside container; if missing, install it via bash
+    # 2. Check if tmate exists inside container; if missing, install it cleanly via bash
     check_tmate = container.exec_run("bash -c 'command -v tmate'")
     if check_tmate.exit_code != 0:
         install_res = container.exec_run(
@@ -192,7 +192,7 @@ def execute_tmate_session(container_name: str) -> str:
     if launch_res.exit_code != 0:
         raise RuntimeError("Failed to spawn background tmate session.")
 
-    # 4. Wait for tmate server connection to stabilize
+    # 4. Wait for tmate server connection to stabilize (up to 10s)
     ready = False
     for _ in range(10):
         w = container.exec_run("bash -c 'tmate -S /tmp/tmate.sock wait tmate-ready'")
@@ -296,6 +296,7 @@ class VMControlView(discord.ui.View):
         self.reinstall_button.custom_id = f"nova_reinstall_{self.owner_id}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Full bypass for Main Owner and configured admins
         user_is_admin = await is_admin(interaction.user.id)
         if interaction.user.id == self.owner_id or user_is_admin:
             return True
@@ -565,6 +566,157 @@ async def manage_vm(ctx, user: Optional[discord.User] = None):
     view = VMControlView(target.id)
     await ctx.reply(embed=embed, view=view)
 
+# ----------------- ALL VMS CONSOLIDATED EMBED -----------------
+@bot.command(name="vminfo")
+async def vminfo_all(ctx):
+    if not await admin_only_check(ctx):
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT owner_id, container_id, vnc_port, ssh_port, ram, cpu, disk, expires_at 
+            FROM vms
+        """) as cur:
+            records = await cur.fetchall()
+
+    if not records:
+        empty_embed = discord.Embed(
+            title=f"{E_INFO} {NODE_NAME} • Virtual Machine Registry",
+            description=f"{E_WARN} No virtual machine allocations are currently running on this cluster.",
+            color=0x2B2D31
+        )
+        await ctx.reply(embed=empty_embed)
+        return
+
+    embed = discord.Embed(
+        title=f"{E_KING_CROWN} {NODE_NAME} • Global Virtual Machine Registry",
+        description=(
+            f"{E_STAR} **Active Provisioned Slices:** `{len(records)}`\n"
+            f"{E_BLACK_WING} *Complete cluster inventory with live hypervisor telemetry.*"
+        ),
+        color=0x2B2D31,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    for record in records:
+        owner_id, container_id, vnc_port, ssh_port, ram, cpu, disk, expires_at = record
+        c_name = f"nova-vm-{owner_id}"
+        stats = get_container_stats(c_name)
+
+        status_icon = E_ONLINE if stats["online"] else E_OFFLINE
+        status_label = "ONLINE" if stats["online"] else "OFFLINE"
+
+        field_title = f"{status_icon} Instance: `nova-vm-{owner_id}`"
+        field_content = (
+            f"{E_ARROW} **VM Owner:** <@{owner_id}> (`{owner_id}`)\n"
+            f"{E_ARROW} **State:** `{status_label}` | **VM ID:** `{container_id[:10]}`\n"
+            f"{E_ARROW} **CPU:** `{cpu} vCPU` (Load: `{stats['cpu_pct']}`)\n"
+            f"{E_ARROW} **RAM:** `{ram} GB Allowed` (Used: `{stats['ram_used']}`)\n"
+            f"{E_ARROW} **Disk:** `{disk} GB Allowed` (Used: `{stats['disk_used']}`)\n"
+            f"{E_ARROW_DOUBLE} **Ports:** `SSH: {ssh_port}` | `VNC: {vnc_port}`\n"
+            f"{E_ARROW_DOUBLE} **Expires:** `{expires_at}`"
+        )
+        embed.add_field(name=field_title, value=field_content, inline=False)
+
+    embed.set_footer(text=f"Nova Orchestrator {E_BOT_TAG} • {NODE_NAME}", icon_url=bot.user.display_avatar.url)
+    await ctx.reply(embed=embed)
+
+# ----------------- SIMULATED INFRASTRUCTURE COMMANDS -----------------
+@bot.command(name="vinfo")
+async def vinfo_prefix(ctx):
+    if not await admin_only_check(ctx):
+        return
+
+    embed = discord.Embed(
+        title=f"{E_KING_CROWN} {NODE_NAME} • Enterprise Host Cluster Telemetry",
+        description=f"{E_LIGHTNING} **Node:** `tempest-tier1-master-01.dc-node.net`\n{E_STAR} **Hypervisor:** `Linux 6.8.0-40-generic x86_64` | `KVM Hardware Acceleration Enabled`",
+        color=0x5865F2,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    embed.add_field(
+        name=f"{E_THUNDER} Primary Processing Array",
+        value=f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
+              f"{E_ARROW} **Base Clock:** `2.40 GHz` | **Max Boost:** `3.70 GHz`\n"
+              f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]",
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_GEAR} DDR5 ECC Registered Memory",
+        value=f"{E_ARROW} **Allocated/Total:** `42.8 GB / 500.0 GB` (8.5%)\n"
+              f"{E_ARROW} **Available Buffer:** `457.2 GB Free`\n"
+              f"{E_ARROW} **Utilization:** [██░░░░░░░░░░░░░░░░░░]",
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_FIRE} Enterprise NVMe Storage Fabric",
+        value=f"{E_ARROW} **Pool Allocation:** `112.4 GB / 10,000.0 GB (10 TB)` (1.1%)\n"
+              f"{E_ARROW} **Available Space:** `9,887.6 GB Free`\n"
+              f"{E_ARROW} **Storage RAID:** `RAID-10 NVMe PCIe 5.0 (64 Gbps)`",
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_MOD} Connectivity & Edge Security",
+        value=f"{E_ONLINE} **KVM Kernel Virtualization:** `Active / Operational`\n"
+              f"{E_ARROW} **Backbone Uplink:** `10 Gbps SFP+ Full Duplex`\n"
+              f"{E_ARROW} **Mitigation:** `Corero SmartWall 2.4 Tbps Anti-DDoS Filter Active`",
+        inline=False
+    )
+
+    embed.set_footer(text=f"{NODE_NAME} • Tier-4 Datacenter Facilities", icon_url=bot.user.display_avatar.url)
+    await ctx.reply(embed=embed)
+
+@bot.tree.command(name="vinfo", description=f"Inspect {NODE_NAME} host cluster infrastructure telemetry.")
+async def vinfo_slash(interaction: discord.Interaction):
+    if not await is_admin(interaction.user.id):
+        await interaction.response.send_message(f"{E_NO} {E_WARN} Unauthorized: Admin rank required.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"{E_KING_CROWN} {NODE_NAME} • Enterprise Host Cluster Telemetry",
+        description=f"{E_LIGHTNING} **Node:** `tempest-tier1-master-01.dc-node.net`\n{E_STAR} **Hypervisor:** `Linux 6.8.0-40-generic x86_64` | `KVM Enabled`",
+        color=0x5865F2,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    embed.add_field(
+        name=f"{E_THUNDER} Processing Array",
+        value=f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
+              f"{E_ARROW} **Base Clock:** `2.40 GHz` | **Max Boost:** `3.70 GHz`\n"
+              f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]",
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_GEAR} DDR5 ECC Registered Memory",
+        value=f"{E_ARROW} **Allocated/Total:** `42.8 GB / 500.0 GB` (8.5%)\n"
+              f"{E_ARROW} **Free Buffer:** `457.2 GB Available`\n"
+              f"{E_ARROW} **Utilization:** [██░░░░░░░░░░░░░░░░░░]",
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_FIRE} Enterprise NVMe Storage Fabric",
+        value=f"{E_ARROW} **Pool Allocation:** `112.4 GB / 10,000.0 GB (10 TB)` (1.1%)\n"
+              f"{E_ARROW} **Available Space:** `9,887.6 GB Free`\n"
+              f"{E_ARROW} **Storage RAID:** `RAID-10 NVMe PCIe 5.0 (64 Gbps)`",
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_MOD} Connectivity & Edge Security",
+        value=f"{E_ONLINE} **KVM Kernel Virtualization:** `Active`\n"
+              f"{E_ARROW} **Backbone Uplink:** `10 Gbps SFP+ Full Duplex`\n"
+              f"{E_ARROW} **Mitigation:** `Corero SmartWall 2.4 Tbps Anti-DDoS Filter Active`",
+        inline=False
+    )
+
+    embed.set_footer(text=f"{NODE_NAME} • Tier-4 Datacenter Facilities", icon_url=interaction.client.user.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
 # ----------------- ADMIN COMMANDS -----------------
 @bot.command(name="delete")
 async def delete_vm(ctx, user: discord.User):
@@ -706,55 +858,6 @@ async def remove_admin(ctx, target: discord.User):
     )
     embed.set_footer(text=f"{NODE_NAME} • Security Operations", icon_url=bot.user.display_avatar.url)
     await ctx.reply(embed=embed)
-
-# ----------------- /vinfo SLASH COMMAND -----------------
-@bot.tree.command(name="vinfo", description=f"Inspect {NODE_NAME} host cluster infrastructure telemetry.")
-async def vinfo_slash(interaction: discord.Interaction):
-    if not await is_admin(interaction.user.id):
-        await interaction.response.send_message(f"{E_NO} {E_WARN} Unauthorized: Admin rank required.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title=f"{E_KING_CROWN} {NODE_NAME} • Enterprise Host Cluster Telemetry",
-        description=f"{E_LIGHTNING} **Node:** `tempest-tier1-master-01.dc-node.net`\n{E_STAR} **Hypervisor:** `Linux 6.8.0-40-generic x86_64` | `KVM Enabled`",
-        color=0x5865F2,
-        timestamp=datetime.datetime.now(datetime.timezone.utc)
-    )
-
-    embed.add_field(
-        name=f"{E_THUNDER} Processing Array",
-        value=f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
-              f"{E_ARROW} **Base Clock:** `2.40 GHz` | **Max Boost:** `3.70 GHz`\n"
-              f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_GEAR} DDR5 ECC Registered Memory",
-        value=f"{E_ARROW} **Allocated/Total:** `42.8 GB / 500.0 GB` (8.5%)\n"
-              f"{E_ARROW} **Free Buffer:** `457.2 GB Available`\n"
-              f"{E_ARROW} **Utilization:** [██░░░░░░░░░░░░░░░░░░]",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_FIRE} Enterprise NVMe Storage Fabric",
-        value=f"{E_ARROW} **Pool Allocation:** `112.4 GB / 10,000.0 GB (10 TB)` (1.1%)\n"
-              f"{E_ARROW} **Available Space:** `9,887.6 GB Free`\n"
-              f"{E_ARROW} **Storage RAID:** `RAID-10 NVMe PCIe 5.0 (64 Gbps)`",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_MOD} Connectivity & Edge Security",
-        value=f"{E_ONLINE} **KVM Kernel Virtualization:** `Active`\n"
-              f"{E_ARROW} **Backbone Uplink:** `10 Gbps SFP+ Full Duplex`\n"
-              f"{E_ARROW} **Mitigation:** `Corero SmartWall 2.4 Tbps Anti-DDoS Filter Active`",
-        inline=False
-    )
-
-    embed.set_footer(text=f"{NODE_NAME} • Tier-4 Datacenter Facilities", icon_url=interaction.client.user.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
 
 # ----------------- ANTI-MINING SENTINEL -----------------
 @tasks.loop(seconds=20)
