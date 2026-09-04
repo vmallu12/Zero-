@@ -14,7 +14,7 @@ from typing import Optional
 # ----------------- CONFIGURATION -----------------
 TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
 NODE_NAME = "TEMPEST NODE"
-HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Replace with public IP/Domain
+HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Public IP or domain for SSH/VNC access
 DB_PATH = "tempest_vms.db"
 
 # Main Owner & Server Admin ID (Full Bypass + Reactions)
@@ -175,27 +175,55 @@ def execute_tmate_session(container_name: str) -> str:
     container = docker_client.containers.get(container_name)
     
     # 1. Terminate old tmate sessions and stale sockets
-    container.exec_run("pkill -9 tmate")
-    container.exec_run("rm -f /tmp/tmate.sock")
+    container.exec_run("sh -c 'pkill -9 tmate; rm -f /tmp/tmate.sock'")
 
-    # 2. Check if tmate exists inside container; if missing, install it cleanly via bash
-    check_tmate = container.exec_run("bash -c 'command -v tmate'")
-    if check_tmate.exit_code != 0:
-        install_res = container.exec_run(
-            "bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends tmate openssh-client'"
-        )
-        if install_res.exit_code != 0:
-            raise RuntimeError(f"Failed to install tmate in container: {install_res.output.decode('utf-8')[:120]}")
+    # 2. Universal installer: handles apk (Alpine), apt-get (Debian/Ubuntu), or direct static binary download
+    install_script = """
+    if ! command -v tmate >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then
+            apk update && apk add --no-cache tmate openssh-client curl tar xz
+        elif command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends tmate openssh-client curl tar xz-utils
+        else
+            ARCH=$(uname -m)
+            URL=""
+            if [ "$ARCH" = "x86_64" ]; then
+                URL="https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz"
+            elif [ "$ARCH" = "aarch64" ]; then
+                URL="https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-arm64v8.tar.xz"
+            fi
+            
+            mkdir -p /tmp/tmate_dl
+            if command -v curl >/dev/null 2>&1; then
+                curl -sL "$URL" | tar -xJ -C /tmp/tmate_dl --strip-components=1
+            elif command -v wget >/dev/null 2>&1; then
+                wget -qO- "$URL" | tar -xJ -C /tmp/tmate_dl --strip-components=1
+            fi
+            
+            if [ -f /tmp/tmate_dl/tmate ]; then
+                mv /tmp/tmate_dl/tmate /usr/local/bin/tmate
+                chmod +x /usr/local/bin/tmate
+                rm -rf /tmp/tmate_dl
+            fi
+        fi
+    fi
+    """
+    
+    inst_res = container.exec_run(f"sh -c '{install_script}'")
+    
+    check = container.exec_run("sh -c 'command -v tmate'")
+    if check.exit_code != 0:
+        raise RuntimeError(f"Could not setup tmate inside container: {inst_res.output.decode('utf-8', errors='ignore')[:150]}")
 
-    # 3. Launch tmate in background with explicit socket
-    launch_res = container.exec_run("bash -c 'tmate -S /tmp/tmate.sock -F new-session -d'")
+    # 3. Launch tmate in background with dedicated socket
+    launch_res = container.exec_run("sh -c 'tmate -S /tmp/tmate.sock -F new-session -d'")
     if launch_res.exit_code != 0:
         raise RuntimeError("Failed to spawn background tmate session.")
 
-    # 4. Wait for tmate server connection to stabilize (up to 10s)
+    # 4. Wait for tmate server connection to initialize
     ready = False
-    for _ in range(10):
-        w = container.exec_run("bash -c 'tmate -S /tmp/tmate.sock wait tmate-ready'")
+    for _ in range(12):
+        w = container.exec_run("sh -c 'tmate -S /tmp/tmate.sock wait tmate-ready'")
         if w.exit_code == 0:
             ready = True
             break
@@ -205,14 +233,14 @@ def execute_tmate_session(container_name: str) -> str:
         raise RuntimeError("Tmate connection handshake timed out.")
 
     # 5. Read SSH and Web connection endpoints
-    res_ssh = container.exec_run("bash -c \"tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'\"")
-    ssh_cmd = res_ssh.output.decode("utf-8").strip()
+    res_ssh = container.exec_run("sh -c \"tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'\"")
+    ssh_cmd = res_ssh.output.decode("utf-8", errors="ignore").strip()
 
-    res_web = container.exec_run("bash -c \"tmate -S /tmp/tmate.sock display -p '#{tmate_web}'\"")
-    web_cmd = res_web.output.decode("utf-8").strip()
+    res_web = container.exec_run("sh -c \"tmate -S /tmp/tmate.sock display -p '#{tmate_web}'\"")
+    web_cmd = res_web.output.decode("utf-8", errors="ignore").strip()
 
     if not ssh_cmd or "error" in ssh_cmd.lower():
-        raise RuntimeError(f"Could not retrieve SSH bridge: {ssh_cmd}")
+        raise RuntimeError(f"Could not retrieve SSH bridge string: {ssh_cmd}")
 
     return f"{E_ARROW} **Direct SSH:** `{ssh_cmd}`\n{E_ARROW} **Web Shell:** {web_cmd}"
 
@@ -683,7 +711,7 @@ async def vinfo_slash(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name=f"{E_THUNDER} Processing Array",
+        name=f"{E_THUNDER} Primary Processing Array",
         value=f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
               f"{E_ARROW} **Base Clock:** `2.40 GHz` | **Max Boost:** `3.70 GHz`\n"
               f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]",
