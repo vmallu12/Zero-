@@ -8,15 +8,16 @@ import os
 import random
 import string
 import datetime
+import time
 from typing import Optional
 
 # ----------------- CONFIGURATION -----------------
 TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
 NODE_NAME = "TEMPEST NODE"
-HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Replace with node IP or public hostname
+HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Replace with node IP or domain
 DB_PATH = "tempest_vms.db"
 
-# Main Owner & Server Admin ID (Full Access + Reactions)
+# Main Owner & Server Admin ID (Full Bypass + Reactions)
 MAIN_OWNER_ID = 1447083500720230401
 DEFAULT_ADMIN_IDS = [MAIN_OWNER_ID]
 ALERT_CHANNEL_ID = 1519219646358622259
@@ -172,24 +173,47 @@ def launch_vm_container(owner_id: int, ram: str, cpu: str, disk: str, vnc_port: 
 
 def execute_tmate_session(container_name: str) -> str:
     container = docker_client.containers.get(container_name)
+    
+    # 1. Terminate old tmate sessions and stale sockets
     container.exec_run("pkill -9 tmate")
     container.exec_run("rm -f /tmp/tmate.sock")
-    
-    check_tmate = container.exec_run("which tmate")
-    if check_tmate.exit_code != 0:
-        container.exec_run("apt-get update && apt-get install -y tmate")
 
-    container.exec_run("tmate -S /tmp/tmate.sock -F new-session -d")
-    container.exec_run("tmate -S /tmp/tmate.sock wait tmate-ready")
-    
-    res = container.exec_run("tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'")
-    ssh_cmd = res.output.decode("utf-8").strip()
-    
-    res_web = container.exec_run("tmate -S /tmp/tmate.sock display -p '#{tmate_web}'")
+    # 2. Check if tmate exists inside container; if missing, install it via bash
+    check_tmate = container.exec_run("bash -c 'command -v tmate'")
+    if check_tmate.exit_code != 0:
+        install_res = container.exec_run(
+            "bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends tmate openssh-client'"
+        )
+        if install_res.exit_code != 0:
+            raise RuntimeError(f"Failed to install tmate in container: {install_res.output.decode('utf-8')[:120]}")
+
+    # 3. Launch tmate in background with explicit socket
+    launch_res = container.exec_run("bash -c 'tmate -S /tmp/tmate.sock -F new-session -d'")
+    if launch_res.exit_code != 0:
+        raise RuntimeError("Failed to spawn background tmate session.")
+
+    # 4. Wait for tmate server connection to stabilize
+    ready = False
+    for _ in range(10):
+        w = container.exec_run("bash -c 'tmate -S /tmp/tmate.sock wait tmate-ready'")
+        if w.exit_code == 0:
+            ready = True
+            break
+        time.sleep(1)
+
+    if not ready:
+        raise RuntimeError("Tmate connection handshake timed out.")
+
+    # 5. Read SSH and Web connection endpoints
+    res_ssh = container.exec_run("bash -c \"tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'\"")
+    ssh_cmd = res_ssh.output.decode("utf-8").strip()
+
+    res_web = container.exec_run("bash -c \"tmate -S /tmp/tmate.sock display -p '#{tmate_web}'\"")
     web_cmd = res_web.output.decode("utf-8").strip()
-    
-    if not ssh_cmd:
-        raise RuntimeError("Failed to establish isolated tmate bridge.")
+
+    if not ssh_cmd or "error" in ssh_cmd.lower():
+        raise RuntimeError(f"Could not retrieve SSH bridge: {ssh_cmd}")
+
     return f"{E_ARROW} **Direct SSH:** `{ssh_cmd}`\n{E_ARROW} **Web Shell:** {web_cmd}"
 
 def get_container_stats(container_name: str):
@@ -272,7 +296,6 @@ class VMControlView(discord.ui.View):
         self.reinstall_button.custom_id = f"nova_reinstall_{self.owner_id}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Full bypass for Main Owner and configured admins
         user_is_admin = await is_admin(interaction.user.id)
         if interaction.user.id == self.owner_id or user_is_admin:
             return True
@@ -451,11 +474,10 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore bot self messages
     if message.author.bot:
         return
 
-    # React to any message sent by the main owner
+    # React to any message sent by the main owner across all channels
     if message.author.id == MAIN_OWNER_ID:
         for emoji_str in OWNER_REACTIONS:
             try:
@@ -463,10 +485,9 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-    # Process all other standard bot commands
     await bot.process_commands(message)
 
-# ----------------- !vm COMMAND -----------------
+# ----------------- VM PROVISIONING COMMAND -----------------
 @bot.command(name="vm")
 async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User):
     if not await admin_only_check(ctx):
@@ -519,11 +540,12 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User):
     except Exception as e:
         await status_msg.edit(content=f"{E_NO} **Hardware Allocation Fault:** `{str(e)}`")
 
-# ----------------- !manage COMMAND -----------------
+# ----------------- VM MANAGEMENT COMMAND -----------------
 @bot.command(name="manage")
 async def manage_vm(ctx, user: Optional[discord.User] = None):
     target = user if user else ctx.author
     
+    # Non-admins cannot inspect other members' VMs
     if target != ctx.author and not await is_admin(ctx.author.id):
         await ctx.reply(f"{E_NO} {E_WARN} Unauthorized: Only administrators may inspect other members' virtual machines.")
         return
@@ -627,18 +649,62 @@ async def list_all_vms(ctx):
 
     await ctx.reply(embed=embed)
 
-@bot.command(name="giveadmin")
-async def giveadmin(ctx, target: discord.User):
+@bot.command(name="setadmin", aliases=["giveadmin"])
+async def set_admin(ctx, target: discord.User):
     if not await admin_only_check(ctx):
         return
+
     async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM admins WHERE user_id = ?", (target.id,)) as cur:
+            if await cur.fetchone():
+                await ctx.reply(f"{E_WARN} {target.mention} is already registered as an administrator.")
+                return
+
         await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (target.id,))
         await db.commit()
+
     embed = discord.Embed(
-        title=f"{E_CHECK} Permission Granted",
-        description=f"{E_ARROW} User {target.mention} elevated to **{NODE_NAME} Administrator** {E_MOD}.",
-        color=0x57F287
+        title=f"{E_KING_CROWN} {NODE_NAME} • Privilege Escalation",
+        description=(
+            f"{E_CHECK} {E_YES} **Administrator Rank Assigned!**\n\n"
+            f"{E_ARROW} **User:** {target.mention} (`{target.id}`)\n"
+            f"{E_ARROW} **Assigned By:** {ctx.author.mention}\n"
+            f"{E_ARROW} **Permissions:** Full Hypervisor & VM Management Access {E_MOD}"
+        ),
+        color=0x57F287,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
+    embed.set_footer(text=f"{NODE_NAME} • Security Operations", icon_url=bot.user.display_avatar.url)
+    await ctx.reply(embed=embed)
+
+@bot.command(name="removeadmin")
+async def remove_admin(ctx, target: discord.User):
+    if not await admin_only_check(ctx):
+        return
+
+    if target.id == MAIN_OWNER_ID:
+        await ctx.reply(f"{E_NO} {E_WARN} The Main Server Owner's privileges cannot be revoked.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("DELETE FROM admins WHERE user_id = ?", (target.id,)) as cur:
+            if cur.rowcount == 0:
+                await ctx.reply(f"{E_WARN} {target.mention} is not in the administrator registry.")
+                return
+        await db.commit()
+
+    embed = discord.Embed(
+        title=f"{E_WARN} {NODE_NAME} • Privilege Revocation",
+        description=(
+            f"{E_CHECK} **Administrator Rank Revoked!**\n\n"
+            f"{E_ARROW} **User:** {target.mention} (`{target.id}`)\n"
+            f"{E_ARROW} **Revoked By:** {ctx.author.mention}\n"
+            f"{E_DOWN} Node and hypervisor management permissions were stripped."
+        ),
+        color=0xED4245,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.set_footer(text=f"{NODE_NAME} • Security Operations", icon_url=bot.user.display_avatar.url)
     await ctx.reply(embed=embed)
 
 # ----------------- /vinfo SLASH COMMAND -----------------
