@@ -9,12 +9,13 @@ import random
 import string
 import datetime
 import time
+import re
 from typing import Optional
 
 # ----------------- CONFIGURATION -----------------
-TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
+TOKEN = "MTQ3OTA4MDA4MTAwMjMzNjM3MQ.GR6D92.sq3TfpvNVFkjCoH1teX7FQJODkejtjBlCsF5CU"
 NODE_NAME = "TEMPEST NODE"
-HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Replace with node IP or public hostname
+HOST_IP = "YOUR_SERVER_PUBLIC_IP"
 DB_PATH = "tempest_vms.db"
 
 # Main Owner & Server Admin ID (Full Bypass + Reactions)
@@ -80,11 +81,10 @@ E_DRACORACE = "<:Dracorace:1519765639185826009>"
 E_XIERON = "<a:Xieron_stolen_emoji_1769602482:1519587124888866928>"
 E_NCS = "<a:emojigg_NCS:1545028575751569419>"
 
-# Specific Owner Auto-Reactions (Left, Center, Right)
 OWNER_REACTIONS = [
-    "arrow:1519556677173510325",       # <a:arrow:1519556677173510325>
-    "1_crown:1519585072687222936",     # <:1_crown:1519585072687222936>
-    "leftarrow:1519585449713074226"    # <a:leftarrow:1519585449713074226>
+    "arrow:1519556677173510325",
+    "1_crown:1519585072687222936",
+    "leftarrow:1519585449713074226"
 ]
 
 intents = discord.Intents.all()
@@ -171,64 +171,81 @@ def launch_vm_container(owner_id: int, ram: str, cpu: str, disk: str, vnc_port: 
     )
     return container.id
 
-def execute_shhx_session(container_name: str) -> str:
+def execute_sshx_session(container_name: str) -> str:
     container = docker_client.containers.get(container_name)
     
-    # 1. Kill old sessions and wipe logs
-    container.exec_run("sh -c 'pkill -9 shhx; pkill -9 shh; rm -f /tmp/shhx.log'")
+    # Kill old sessions and clear previous output logs
+    container.exec_run("sh -c 'pkill -9 sshx; rm -f /tmp/sshx.log'")
 
-    # 2. Check and install shhx standalone binary if missing
-    check = container.exec_run("sh -c 'command -v shhx'")
-    if check.exit_code != 0:
-        install_script = """
+    check_bin = container.exec_run("sh -c 'command -v /usr/local/bin/sshx || command -v sshx'")
+    if check_bin.exit_code != 0:
+        setup_script = """
         ARCH=$(uname -m)
-        DL_URL=""
+        URL=""
         if [ "$ARCH" = "x86_64" ]; then
-            DL_URL="https://github.com/antoniomika/shhx/releases/latest/download/shhx_linux_amd64"
+            URL="https://github.com/ekzhang/sshx/releases/latest/download/sshx-x86_64-unknown-linux-musl.tar.gz"
         elif [ "$ARCH" = "aarch64" ]; then
-            DL_URL="https://github.com/antoniomika/shhx/releases/latest/download/shhx_linux_arm64"
+            URL="https://github.com/ekzhang/sshx/releases/latest/download/sshx-aarch64-unknown-linux-musl.tar.gz"
         fi
 
-        if [ -n "$DL_URL" ]; then
+        if [ -n "$URL" ]; then
+            mkdir -p /tmp/sshx_dl
             if command -v curl >/dev/null 2>&1; then
-                curl -k -fsSL "$DL_URL" -o /usr/local/bin/shhx
+                curl -k -fsSL "$URL" | tar -xz -C /tmp/sshx_dl 2>/dev/null
             elif command -v wget >/dev/null 2>&1; then
-                wget --no-check-certificate -qO /usr/local/bin/shhx "$DL_URL"
+                wget --no-check-certificate -qO- "$URL" | tar -xz -C /tmp/sshx_dl 2>/dev/null
             fi
-            chmod +x /usr/local/bin/shhx 2>/dev/null
+
+            if [ -f /tmp/sshx_dl/sshx ]; then
+                mv /tmp/sshx_dl/sshx /usr/local/bin/sshx
+                chmod +x /usr/local/bin/sshx
+                rm -rf /tmp/sshx_dl
+            fi
+        fi
+
+        if ! command -v /usr/local/bin/sshx >/dev/null 2>&1; then
+            if command -v curl >/dev/null 2>&1; then
+                curl -sSf https://sshx.io/get | sh 2>/dev/null
+            elif command -v wget >/dev/null 2>&1; then
+                wget -qO- https://sshx.io/get | sh 2>/dev/null
+            fi
+            if [ -f /root/.sshx/sshx ]; then
+                cp /root/.sshx/sshx /usr/local/bin/sshx
+                chmod +x /usr/local/bin/sshx
+            fi
         fi
         """
-        container.exec_run(f"sh -c '{install_script}'")
+        container.exec_run(f"sh -c '{setup_script}'")
 
-    # Double verify binary exists
-    check = container.exec_run("sh -c 'command -v shhx'")
-    if check.exit_code != 0:
-        raise RuntimeError("Failed to download and configure shhx binary.")
+    verify = container.exec_run("sh -c 'command -v /usr/local/bin/sshx || command -v sshx || [ -f /root/.sshx/sshx ]'")
+    if verify.exit_code != 0:
+        raise RuntimeError("Failed to download and configure the standalone sshx binary.")
 
-    # 3. Launch shhx daemon in background logging to /tmp/shhx.log
-    container.exec_run("sh -c 'nohup shhx > /tmp/shhx.log 2>&1 &'")
+    spawn_cmd = """
+    BIN="$(command -v /usr/local/bin/sshx || command -v sshx || echo /root/.sshx/sshx)"
+    nohup "$BIN" > /tmp/sshx.log 2>&1 &
+    """
+    container.exec_run(f"sh -c '{spawn_cmd}'")
 
-    # 4. Parse tunnel connection string from the log output (up to 12s)
-    access_info = None
-    for _ in range(12):
+    access_link = None
+    ansi_regex = re.compile(r'\x1b\[[0-9;]*m')
+    
+    for _ in range(15):
         time.sleep(1)
-        log_res = container.exec_run("sh -c 'cat /tmp/shhx.log 2>/dev/null'")
-        logs = log_res.output.decode("utf-8", errors="ignore")
+        log_res = container.exec_run("sh -c 'cat /tmp/sshx.log 2>/dev/null'")
+        raw_logs = log_res.output.decode("utf-8", errors="ignore")
+        clean_logs = ansi_regex.sub('', raw_logs)
         
-        # shhx produces SSH/Web connections like 'ssh ...@shhx.app' or direct URLs
-        lines = [line.strip() for line in logs.splitlines() if line.strip()]
-        for line in lines:
-            if "ssh " in line.lower() or "http" in line.lower():
-                access_info = "\n".join(lines[-2:]) if len(lines) >= 2 else line
-                break
-        if access_info:
+        match = re.search(r'https://sshx\.io/s/[a-zA-Z0-9#-_]+', clean_logs)
+        if match:
+            access_link = match.group(0).strip()
             break
 
-    if not access_info:
-        log_sample = logs[-120:] if 'logs' in locals() else 'No log output'
-        raise RuntimeError(f"shhx failed to output relay string: {log_sample}")
+    if not access_link:
+        log_sample = clean_logs[-150:] if 'clean_logs' in locals() and clean_logs else 'No logs captured'
+        raise RuntimeError(f"sshx failed to bind endpoint: {log_sample}")
 
-    return f"{E_ARROW} **Connection Information:**\n```{access_info}```"
+    return access_link
 
 def get_container_stats(container_name: str):
     try:
@@ -299,18 +316,17 @@ async def dispatch_private_credentials(user: discord.User, data: tuple, is_admin
     embed.set_footer(text=footer_text, icon_url=bot.user.display_avatar.url)
     await user.send(embed=embed)
 
-# ----------------- STRICTLY LOCKED VIEW -----------------
+# ----------------- STRICTLY LOCKED VIEW WITH POPUP LOADER -----------------
 class VMControlView(discord.ui.View):
     def __init__(self, owner_id: int):
         super().__init__(timeout=None)
         self.owner_id = owner_id
         
-        self.ssh_button.custom_id = f"nova_shhx_{self.owner_id}"
+        self.ssh_button.custom_id = f"nova_sshx_{self.owner_id}"
         self.view_keys_button.custom_id = f"nova_keys_{self.owner_id}"
         self.reinstall_button.custom_id = f"nova_reinstall_{self.owner_id}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Full bypass for Main Owner and configured admins
         user_is_admin = await is_admin(interaction.user.id)
         if interaction.user.id == self.owner_id or user_is_admin:
             return True
@@ -322,31 +338,70 @@ class VMControlView(discord.ui.View):
         )
         return False
 
-    @discord.ui.button(label="Generate SSH (SHHX)", style=discord.ButtonStyle.primary, emoji="⚡")
+    @discord.ui.button(label="Generate SSH (SSHX)", style=discord.ButtonStyle.primary, emoji="⚡")
     async def ssh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        # 1. Pop-up Initial Processing/Loading Embed
+        loading_embed = discord.Embed(
+            title=f"{E_LOADING} {NODE_NAME} • Initializing SSH Bridge",
+            description=f"{E_ARROW} Connecting to `nova-vm-{self.owner_id}`...\n"
+                        f"{E_GEAR} Terminating previous sessions and registering tunnel endpoint...",
+            color=0xFEE75C
+        )
+        loading_embed.set_footer(text=f"{NODE_NAME} • Secure Tunnel Core", icon_url=interaction.client.user.display_avatar.url)
+        await interaction.response.send_message(embed=loading_embed, ephemeral=True)
+
         container_name = f"nova-vm-{self.owner_id}"
-        
+        loop = asyncio.get_running_loop()
+
         try:
-            loop = asyncio.get_running_loop()
-            shhx_info = await loop.run_in_executor(None, execute_shhx_session, container_name)
-            
-            embed = discord.Embed(
-                title=f"{E_LIGHTNING} {NODE_NAME} • Private Terminal Bridge (SHHX)",
-                description=f"{E_STAR} Ephemeral bridge generated for `{container_name}`.\n{E_WARN} *Any previous sessions have been killed.*",
+            # 2. Execute SSHX logic in thread
+            access_link = await loop.run_in_executor(None, execute_sshx_session, container_name)
+
+            # Send Detailed Session Embed to User DM
+            dm_embed = discord.Embed(
+                title=f"{E_LIGHTNING} {NODE_NAME} • Private Terminal Bridge (SSHX)",
+                description=f"{E_STAR} Ephemeral shell tunnel registered for `{container_name}`.\n{E_WARN} *All former background sessions terminated.*",
                 color=0x5865F2,
                 timestamp=datetime.datetime.now(datetime.timezone.utc)
             )
-            embed.add_field(name=f"{E_GEAR} Shell Relay Access", value=shhx_info, inline=False)
-            embed.set_footer(text=f"{NODE_NAME} • Secure Console Bridge", icon_url=interaction.client.user.display_avatar.url)
-            
+            dm_embed.add_field(
+                name=f"{E_GEAR} Direct Web Shell Endpoint",
+                value=f"{E_ARROW} **Connection URL:**\n{access_link}\n\n{E_FIRE} *Open the link in any web browser for terminal access.*",
+                inline=False
+            )
+            dm_embed.set_footer(text=f"{NODE_NAME} • Ephemeral Bridge", icon_url=interaction.client.user.display_avatar.url)
+
+            dm_delivered = True
             try:
-                await interaction.user.send(embed=embed)
-                await interaction.followup.send(f"{E_CHECK} {E_YES} SHHX access string delivered directly to your DMs.", ephemeral=True)
+                await interaction.user.send(embed=dm_embed)
             except discord.Forbidden:
-                await interaction.followup.send(f"{E_WARN} DM delivery failed! Please enable direct messages in your privacy settings.", ephemeral=True)
+                dm_delivered = False
+
+            # 3. Update loading popup embed to SUCCESS
+            success_embed = discord.Embed(
+                title=f"{E_CHECK} {NODE_NAME} • SSH Tunnel Established",
+                description=(
+                    f"{E_YES} **SSHX bridge generated successfully!**\n\n"
+                    f"{E_ARROW} **Instance:** `nova-vm-{self.owner_id}`\n"
+                    f"{E_ARROW} **Direct Web Access:** [Click Here to Open Shell]({access_link})\n"
+                    + (f"{E_STAR} *Access strings also dispatched to your private DMs.*" if dm_delivered else f"{E_WARN} *Your DMs are closed, please use the link above!*")
+                ),
+                color=0x57F287,
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            success_embed.set_footer(text=f"{NODE_NAME} • Hypervisor Core", icon_url=interaction.client.user.display_avatar.url)
+            await interaction.edit_original_response(embed=success_embed)
+
         except Exception as e:
-            await interaction.followup.send(f"{E_NO} Bridge error: `{str(e)}`", ephemeral=True)
+            # 4. Update loading popup embed to FAILED
+            fail_embed = discord.Embed(
+                title=f"{E_NO} {NODE_NAME} • Bridge Failure",
+                description=f"{E_WARN} **An error occurred while deploying the SSH tunnel:**\n\n```{str(e)}```",
+                color=0xED4245,
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            fail_embed.set_footer(text=f"{NODE_NAME} • Operations Diagnostic", icon_url=interaction.client.user.display_avatar.url)
+            await interaction.edit_original_response(embed=fail_embed)
 
     @discord.ui.button(label="View Passwords (DM)", style=discord.ButtonStyle.secondary, emoji="🔑")
     async def view_keys_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -368,614 +423,44 @@ class VMControlView(discord.ui.View):
             await dispatch_private_credentials(interaction.user, data, is_admin_viewer=is_adm)
             await interaction.followup.send(f"{E_CHECK} {E_YES} Passwords and direct SSH strings dispatched to your DMs.", ephemeral=True)
         except discord.Forbidden:
-            await interaction.followup.send(f"{E_WARN} Could not DM you. Please enable direct messages.", ephemeral=True)
+            await interaction.followup.send(f"{E_WARN} Could not DM you. Please enable direct messages in server settings.", ephemeral=True)
 
     @discord.ui.button(label="Reinstall", style=discord.ButtonStyle.danger, emoji="🔄")
     async def reinstall_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        
+        # 1. Pop-up Initial Processing/Loading Embed
+        loading_embed = discord.Embed(
+            title=f"{E_LOADING} {NODE_NAME} • Reinstalling Operating System",
+            description=f"{E_ARROW} Re-imaging root storage volume for `nova-vm-{self.owner_id}`...\n"
+                        f"{E_GEAR} Preserving assigned ports, credentials, and expiry schedules...",
+            color=0xFEE75C
+        )
+        loading_embed.set_footer(text=f"{NODE_NAME} • Hypervisor Provisioner", icon_url=interaction.client.user.display_avatar.url)
+        await interaction.response.send_message(embed=loading_embed, ephemeral=True)
+
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("SELECT ram, cpu, disk, vnc_port, ssh_port, vnc_pass, root_pass FROM vms WHERE owner_id = ?", (self.owner_id,)) as cur:
                 row = await cur.fetchone()
         
         if not row:
-            await interaction.followup.send(f"{E_NO} Virtual machine records not found.", ephemeral=True)
+            fail_embed = discord.Embed(
+                title=f"{E_NO} Reinstall Aborted",
+                description=f"{E_WARN} Virtual machine specifications were not found in the database registry.",
+                color=0xED4245
+            )
+            await interaction.edit_original_response(embed=fail_embed)
             return
 
         ram, cpu, disk, vnc_port, ssh_port, vnc_pass, root_pass = row
+        loop = asyncio.get_running_loop()
         
         try:
-            loop = asyncio.get_running_loop()
+            # 2. Re-image container in thread
             new_id = await loop.run_in_executor(
                 None, launch_vm_container, self.owner_id, ram, cpu, disk, vnc_port, ssh_port, vnc_pass, root_pass
             )
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE vms SET container_id = ? WHERE owner_id = ?", (new_id, self.owner_id))
                 await db.commit()
-            
-            await interaction.followup.send(
-                f"{E_CHECK} {E_GG} Virtual machine **nova-vm-{self.owner_id}** cleanly re-provisioned! Your expiration schedule and network ports were kept safe.",
-                ephemeral=True
-            )
-        except Exception as e:
-            await interaction.followup.send(f"{E_NO} Rebuild failure: `{str(e)}`", ephemeral=True)
 
-# ----------------- ADMIN CHECK -----------------
-async def admin_only_check(ctx):
-    if not await is_admin(ctx.author.id):
-        embed = discord.Embed(
-            title=f"{E_NO} Access Restricted",
-            description=f"{E_WARN} This instruction is strictly restricted to **{NODE_NAME}** Administrators.",
-            color=0xED4245
-        )
-        await ctx.reply(embed=embed, mention_author=False)
-        return False
-    return True
-
-# ----------------- EMBED BUILDER -----------------
-async def build_channel_vm_embed(owner: discord.User, data: tuple) -> discord.Embed:
-    container_id, vnc_port, ssh_port, ram, cpu, disk, root_pass, vnc_pass, expires_at = data
-    c_name = f"nova-vm-{owner.id}"
-    stats = get_container_stats(c_name)
-    
-    status_icon = E_ONLINE if stats["online"] else E_OFFLINE
-    status_label = "ONLINE / OPERATIONAL" if stats["online"] else "OFFLINE / SUSPENDED"
-    
-    embed = discord.Embed(
-        title=f"{E_KING_CROWN} {NODE_NAME} • Virtual Machine Console",
-        description=f"{E_STAR} **Instance Provisioned for {owner.mention}**\n"
-                    f"{E_BLACK_WING} *Protected by Hardware & Network Virtualization Shields*",
-        color=0x2B2D31,
-        timestamp=datetime.datetime.now(datetime.timezone.utc)
-    )
-
-    embed.add_field(
-        name=f"{E_INFO} Virtual Machine Specifications",
-        value=(
-            f"{E_ARROW} **VM Owner:** {owner.mention} (`{owner.id}`)\n"
-            f"{E_ARROW} **Instance Status:** {status_icon} `{status_label}`\n"
-            f"{E_ARROW} **VM ID:** `{container_id[:12]}`\n"
-            f"{E_ARROW} **CPU:** `{cpu} vCPU` (Utilization: `{stats['cpu_pct']}`)\n"
-            f"{E_ARROW} **RAM / Usage:** `{ram} GB` (Active: `{stats['ram_used']}`)\n"
-            f"{E_ARROW} **Disk / Usage:** `{disk} GB` (Volume: `{stats['disk_used']}`)"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_GEAR} Network Endpoints & Lifecycle",
-        value=(
-            f"{E_ARROW_DOUBLE} **SSH Port:** `{ssh_port}`\n"
-            f"{E_ARROW_DOUBLE} **VNC Port:** `{vnc_port}`\n"
-            f"{E_ARROW_DOUBLE} **Lifecycle Expiration:** `{expires_at}`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_FIRE} Access Protection Protocol",
-        value=(
-            f"{E_CHECK} **Ownership Verification:** Active\n"
-            f"{E_ARROW} **Root Passwords:** `🔒 Protected • Dispatched to Owner DM`\n"
-            f"{E_THUNDER} *Only {owner.mention} or Administrators can use the buttons below.*"
-        ),
-        inline=False
-    )
-
-    embed.set_footer(text=f"Nova Orchestrator {E_BOT_TAG} • {NODE_NAME}", icon_url=bot.user.display_avatar.url)
-    return embed
-
-# ----------------- EVENTS & OWNER REACTIONS -----------------
-@bot.event
-async def on_ready():
-    await init_db()
-    
-    # Re-register persistent views so buttons work across restarts
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT owner_id FROM vms") as cur:
-            all_owners = await cur.fetchall()
-            for (owner_id,) in all_owners:
-                bot.add_view(VMControlView(owner_id))
-
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} application slash commands.")
-    except Exception as e:
-        print(f"Failed to sync slash commands: {e}")
-        
-    expiry_check_loop.start()
-    anti_mining_monitor.start()
-    print(f"Nova online for {NODE_NAME} | Main Owner: {MAIN_OWNER_ID}")
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    # React to any message sent by the main owner across all channels
-    if message.author.id == MAIN_OWNER_ID:
-        for emoji_str in OWNER_REACTIONS:
-            try:
-                await message.add_reaction(emoji_str)
-            except Exception:
-                pass
-
-    await bot.process_commands(message)
-
-# ----------------- VM PROVISIONING COMMAND -----------------
-@bot.command(name="vm")
-async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User):
-    if not await admin_only_check(ctx):
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM vms WHERE owner_id = ?", (user.id,)) as cur:
-            if await cur.fetchone():
-                await ctx.reply(f"{E_WARN} {user.mention} already has an active virtual machine! Purge with `!delete` first.")
-                return
-
-    status_msg = await ctx.reply(f"{E_LOADING} Initializing KVM virtualization slices on **{NODE_NAME}**...")
-
-    try:
-        vnc_port = get_free_port(6080)
-        ssh_port = get_free_port(2026)
-        root_pass = gen_password(12)
-        vnc_pass = gen_password(8)
-        created_at = datetime.datetime.now(datetime.timezone.utc)
-        expires_at = (created_at + datetime.timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-        loop = asyncio.get_running_loop()
-        cid = await loop.run_in_executor(
-            None, launch_vm_container, user.id, ram, cpu, disk, vnc_port, ssh_port, vnc_pass, root_pass
-        )
-
-        full_data = (cid, vnc_port, ssh_port, ram, cpu, disk, root_pass, vnc_pass, expires_at)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
-                INSERT INTO vms (owner_id, container_id, vnc_port, ssh_port, ram, cpu, disk, root_pass, vnc_pass, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (user.id, cid, vnc_port, ssh_port, ram, cpu, disk, root_pass, vnc_pass, created_at.strftime("%Y-%m-%d %H:%M:%S UTC"), expires_at))
-            await db.commit()
-
-        dm_sent = True
-        try:
-            await dispatch_private_credentials(user, full_data)
-        except discord.Forbidden:
-            dm_sent = False
-
-        embed = await build_channel_vm_embed(user, full_data)
-        view = VMControlView(user.id)
-        
-        await status_msg.edit(content=None, embed=embed, view=view)
-        
-        if not dm_sent:
-            await ctx.send(f"{E_WARN} {user.mention} could not be DMed their root access passwords because their DMs are locked!")
-
-    except Exception as e:
-        await status_msg.edit(content=f"{E_NO} **Hardware Allocation Fault:** `{str(e)}`")
-
-# ----------------- VM MANAGEMENT COMMAND -----------------
-@bot.command(name="manage")
-async def manage_vm(ctx, user: Optional[discord.User] = None):
-    target = user if user else ctx.author
-    
-    # Non-admins cannot inspect other members' VMs
-    if target != ctx.author and not await is_admin(ctx.author.id):
-        await ctx.reply(f"{E_NO} {E_WARN} Unauthorized: Only administrators may inspect other members' virtual machines.")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT container_id, vnc_port, ssh_port, ram, cpu, disk, root_pass, vnc_pass, expires_at 
-            FROM vms WHERE owner_id = ?
-        """, (target.id,)) as cur:
-            data = await cur.fetchone()
-
-    if not data:
-        await ctx.reply(f"{E_WARN} No virtual machine profile assigned to {target.mention}.")
-        return
-
-    embed = await build_channel_vm_embed(target, data)
-    view = VMControlView(target.id)
-    await ctx.reply(embed=embed, view=view)
-
-# ----------------- ALL VMS CONSOLIDATED EMBED -----------------
-@bot.command(name="vminfo")
-async def vminfo_all(ctx):
-    if not await admin_only_check(ctx):
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT owner_id, container_id, vnc_port, ssh_port, ram, cpu, disk, expires_at 
-            FROM vms
-        """) as cur:
-            records = await cur.fetchall()
-
-    if not records:
-        empty_embed = discord.Embed(
-            title=f"{E_INFO} {NODE_NAME} • Virtual Machine Registry",
-            description=f"{E_WARN} No virtual machine allocations are currently running on this cluster.",
-            color=0x2B2D31
-        )
-        await ctx.reply(embed=empty_embed)
-        return
-
-    embed = discord.Embed(
-        title=f"{E_KING_CROWN} {NODE_NAME} • Global Virtual Machine Registry",
-        description=(
-            f"{E_STAR} **Active Provisioned Slices:** `{len(records)}`\n"
-            f"{E_BLACK_WING} *Complete cluster inventory with live hypervisor telemetry.*"
-        ),
-        color=0x2B2D31,
-        timestamp=datetime.datetime.now(datetime.timezone.utc)
-    )
-
-    for record in records:
-        owner_id, container_id, vnc_port, ssh_port, ram, cpu, disk, expires_at = record
-        c_name = f"nova-vm-{owner_id}"
-        stats = get_container_stats(c_name)
-
-        status_icon = E_ONLINE if stats["online"] else E_OFFLINE
-        status_label = "ONLINE" if stats["online"] else "OFFLINE"
-
-        field_title = f"{status_icon} Instance: `nova-vm-{owner_id}`"
-        field_content = (
-            f"{E_ARROW} **VM Owner:** <@{owner_id}> (`{owner_id}`)\n"
-            f"{E_ARROW} **State:** `{status_label}` | **VM ID:** `{container_id[:10]}`\n"
-            f"{E_ARROW} **CPU:** `{cpu} vCPU` (Load: `{stats['cpu_pct']}`)\n"
-            f"{E_ARROW} **RAM:** `{ram} GB Allowed` (Used: `{stats['ram_used']}`)\n"
-            f"{E_ARROW} **Disk:** `{disk} GB Allowed` (Used: `{stats['disk_used']}`)\n"
-            f"{E_ARROW_DOUBLE} **Ports:** `SSH: {ssh_port}` | `VNC: {vnc_port}`\n"
-            f"{E_ARROW_DOUBLE} **Expires:** `{expires_at}`"
-        )
-        embed.add_field(name=field_title, value=field_content, inline=False)
-
-    embed.set_footer(text=f"Nova Orchestrator {E_BOT_TAG} • {NODE_NAME}", icon_url=bot.user.display_avatar.url)
-    await ctx.reply(embed=embed)
-
-# ----------------- SIMULATED INFRASTRUCTURE COMMANDS -----------------
-@bot.command(name="vinfo")
-async def vinfo_prefix(ctx):
-    if not await admin_only_check(ctx):
-        return
-
-    embed = discord.Embed(
-        title=f"{E_KING_CROWN} {NODE_NAME} • Enterprise Host Cluster Telemetry",
-        description=f"{E_LIGHTNING} **Node:** `tempest-tier1-master-01.dc-node.net`\n{E_STAR} **Hypervisor:** `Linux 6.8.0-40-generic x86_64` | `KVM Hardware Acceleration Enabled`",
-        color=0x5865F2,
-        timestamp=datetime.datetime.now(datetime.timezone.utc)
-    )
-
-    embed.add_field(
-        name=f"{E_THUNDER} Primary Processing Array",
-        value=f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
-              f"{E_ARROW} **Base Clock:** `2.40 GHz` | **Max Boost:** `3.70 GHz`\n"
-              f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_GEAR} DDR5 ECC Registered Memory",
-        value=f"{E_ARROW} **Allocated/Total:** `42.8 GB / 500.0 GB` (8.5%)\n"
-              f"{E_ARROW} **Free Buffer:** `457.2 GB Free`\n"
-              f"{E_ARROW} **Utilization:** [██░░░░░░░░░░░░░░░░░░]",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_FIRE} Enterprise NVMe Storage Fabric",
-        value=f"{E_ARROW} **Pool Allocation:** `112.4 GB / 10,000.0 GB (10 TB)` (1.1%)\n"
-              f"{E_ARROW} **Available Space:** `9,887.6 GB Free`\n"
-              f"{E_ARROW} **Storage RAID:** `RAID-10 NVMe PCIe 5.0 (64 Gbps)`",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_MOD} Connectivity & Edge Security",
-        value=f"{E_ONLINE} **KVM Kernel Virtualization:** `Active / Operational`\n"
-              f"{E_ARROW} **Backbone Uplink:** `10 Gbps SFP+ Full Duplex`\n"
-              f"{E_ARROW} **Mitigation:** `Corero SmartWall 2.4 Tbps Anti-DDoS Filter Active`",
-        inline=False
-    )
-
-    embed.set_footer(text=f"{NODE_NAME} • Tier-4 Datacenter Facilities", icon_url=bot.user.display_avatar.url)
-    await ctx.reply(embed=embed)
-
-@bot.tree.command(name="vinfo", description=f"Inspect {NODE_NAME} host cluster infrastructure telemetry.")
-async def vinfo_slash(interaction: discord.Interaction):
-    if not await is_admin(interaction.user.id):
-        await interaction.response.send_message(f"{E_NO} {E_WARN} Unauthorized: Admin rank required.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title=f"{E_KING_CROWN} {NODE_NAME} • Enterprise Host Cluster Telemetry",
-        description=f"{E_LIGHTNING} **Node:** `tempest-tier1-master-01.dc-node.net`\n{E_STAR} **Hypervisor:** `Linux 6.8.0-40-generic x86_64` | `KVM Enabled`",
-        color=0x5865F2,
-        timestamp=datetime.datetime.now(datetime.timezone.utc)
-    )
-
-    embed.add_field(
-        name=f"{E_THUNDER} Primary Processing Array",
-        value=f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
-              f"{E_ARROW} **Base Clock:** `2.40 GHz` | **Max Boost:** `3.70 GHz`\n"
-              f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_GEAR} DDR5 ECC Registered Memory",
-        value=f"{E_ARROW} **Allocated/Total:** `42.8 GB / 500.0 GB` (8.5%)\n"
-              f"{E_ARROW} **Free Buffer:** `457.2 GB Available`\n"
-              f"{E_ARROW} **Utilization:** [██░░░░░░░░░░░░░░░░░░]",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_FIRE} Enterprise NVMe Storage Fabric",
-        value=f"{E_ARROW} **Pool Allocation:** `112.4 GB / 10,000.0 GB (10 TB)` (1.1%)\n"
-              f"{E_ARROW} **Available Space:** `9,887.6 GB Free`\n"
-              f"{E_ARROW} **Storage RAID:** `RAID-10 NVMe PCIe 5.0 (64 Gbps)`",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{E_MOD} Connectivity & Edge Security",
-        value=f"{E_ONLINE} **KVM Kernel Virtualization:** `Active`\n"
-              f"{E_ARROW} **Backbone Uplink:** `10 Gbps SFP+ Full Duplex`\n"
-              f"{E_ARROW} **Mitigation:** `Corero SmartWall 2.4 Tbps Anti-DDoS Filter Active`",
-        inline=False
-    )
-
-    embed.set_footer(text=f"{NODE_NAME} • Tier-4 Datacenter Facilities", icon_url=interaction.client.user.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
-
-# ----------------- ADMIN COMMANDS -----------------
-@bot.command(name="delete")
-async def delete_vm(ctx, user: discord.User):
-    if not await admin_only_check(ctx):
-        return
-
-    c_name = f"nova-vm-{user.id}"
-    try:
-        container = docker_client.containers.get(c_name)
-        container.remove(force=True)
-    except docker.errors.NotFound:
-        pass
-    except Exception as e:
-        await ctx.reply(f"{E_NO} Hypervisor exception: `{str(e)}`")
-        return
-
-    try:
-        vol = docker_client.volumes.get(f"nova-vm-data-{user.id}")
-        vol.remove(force=True)
-    except Exception:
-        pass
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM vms WHERE owner_id = ?", (user.id,))
-        await db.commit()
-
-    embed = discord.Embed(
-        title=f"{E_CHECK} Node Purged",
-        description=f"{E_ARROW} Virtual slice and NVMe volume for {user.mention} wiped from **{NODE_NAME}**.",
-        color=0xED4245
-    )
-    await ctx.reply(embed=embed)
-
-@bot.command(name="setexp")
-async def set_expiration(ctx, user: discord.User, days: int):
-    if not await admin_only_check(ctx):
-        return
-
-    new_expiry = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S UTC")
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("UPDATE vms SET expires_at = ? WHERE owner_id = ?", (new_expiry, user.id)) as cur:
-            if cur.rowcount == 0:
-                await ctx.reply(f"{E_WARN} Target user does not own an active VM.")
-                return
-        await db.commit()
-
-    embed = discord.Embed(
-        title=f"{E_GEAR} Expiration Schedule Adjusted",
-        description=f"{E_ARROW} Instance lifecycle for {user.mention} set to: `{new_expiry}` ({days} days).",
-        color=0x5865F2
-    )
-    await ctx.reply(embed=embed)
-
-@bot.command(name="allvm")
-async def list_all_vms(ctx):
-    if not await admin_only_check(ctx):
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT owner_id, container_id, ram, cpu, disk, expires_at FROM vms") as cur:
-            records = await cur.fetchall()
-
-    if not records:
-        await ctx.reply(f"{E_INFO} No active virtual instances currently running on **{NODE_NAME}**.")
-        return
-
-    embed = discord.Embed(
-        title=f"{E_KING_CROWN} {NODE_NAME} • Cluster Hardware Registry",
-        description=f"Active KVM hypervisor allocations: `{len(records)}`",
-        color=0x2B2D31
-    )
-
-    for r in records:
-        oid, cid, ram, cpu, disk, exp = r
-        stats = get_container_stats(f"nova-vm-{oid}")
-        icon = E_ONLINE if stats["online"] else E_OFFLINE
-        embed.add_field(
-            name=f"{icon} Node User: <@{oid}>",
-            value=f"{E_ARROW} **Instance:** `{cid[:10]}`\n{E_ARROW} **Specs:** `{cpu} vCPU` | `{ram}G RAM` | `{disk}G Disk`\n{E_ARROW} **Expires:** `{exp}`",
-            inline=True
-        )
-
-    await ctx.reply(embed=embed)
-
-@bot.command(name="setadmin", aliases=["giveadmin"])
-async def set_admin(ctx, target: discord.User):
-    if not await admin_only_check(ctx):
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM admins WHERE user_id = ?", (target.id,)) as cur:
-            if await cur.fetchone():
-                await ctx.reply(f"{E_WARN} {target.mention} is already registered as an administrator.")
-                return
-
-        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (target.id,))
-        await db.commit()
-
-    embed = discord.Embed(
-        title=f"{E_KING_CROWN} {NODE_NAME} • Privilege Escalation",
-        description=(
-            f"{E_CHECK} {E_YES} **Administrator Rank Assigned!**\n\n"
-            f"{E_ARROW} **User:** {target.mention} (`{target.id}`)\n"
-            f"{E_ARROW} **Assigned By:** {ctx.author.mention}\n"
-            f"{E_ARROW} **Permissions:** Full Hypervisor & VM Management Access {E_MOD}"
-        ),
-        color=0x57F287,
-        timestamp=datetime.datetime.now(datetime.timezone.utc)
-    )
-    embed.set_footer(text=f"{NODE_NAME} • Security Operations", icon_url=bot.user.display_avatar.url)
-    await ctx.reply(embed=embed)
-
-@bot.command(name="removeadmin")
-async def remove_admin(ctx, target: discord.User):
-    if not await admin_only_check(ctx):
-        return
-
-    if target.id == MAIN_OWNER_ID:
-        await ctx.reply(f"{E_NO} {E_WARN} The Main Server Owner's privileges cannot be revoked.")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("DELETE FROM admins WHERE user_id = ?", (target.id,)) as cur:
-            if cur.rowcount == 0:
-                await ctx.reply(f"{E_WARN} {target.mention} is not in the administrator registry.")
-                return
-        await db.commit()
-
-    embed = discord.Embed(
-        title=f"{E_WARN} {NODE_NAME} • Privilege Revocation",
-        description=(
-            f"{E_CHECK} **Administrator Rank Revoked!**\n\n"
-            f"{E_ARROW} **User:** {target.mention} (`{target.id}`)\n"
-            f"{E_ARROW} **Revoked By:** {ctx.author.mention}\n"
-            f"{E_DOWN} Node and hypervisor management permissions were stripped."
-        ),
-        color=0xED4245,
-        timestamp=datetime.datetime.now(datetime.timezone.utc)
-    )
-    embed.set_footer(text=f"{NODE_NAME} • Security Operations", icon_url=bot.user.display_avatar.url)
-    await ctx.reply(embed=embed)
-
-# ----------------- ANTI-MINING SENTINEL -----------------
-@tasks.loop(seconds=20)
-async def anti_mining_monitor():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT owner_id, container_id FROM vms") as cur:
-            active_vms = await cur.fetchall()
-
-    for owner_id, container_id in active_vms:
-        c_name = f"nova-vm-{owner_id}"
-        try:
-            container = docker_client.containers.get(c_name)
-            if container.status != "running":
-                continue
-
-            res = container.exec_run("ps aux")
-            if res.exit_code != 0:
-                continue
-
-            ps_output = res.output.decode("utf-8", errors="ignore").lower()
-            detected_miner = None
-            for sig in MINER_SIGNATURES:
-                if sig in ps_output:
-                    detected_miner = sig
-                    break
-
-            if detected_miner:
-                container.remove(force=True)
-                try:
-                    vol = docker_client.volumes.get(f"nova-vm-data-{owner_id}")
-                    vol.remove(force=True)
-                except Exception:
-                    pass
-
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("DELETE FROM vms WHERE owner_id = ?", (owner_id,))
-                    await db.commit()
-
-                channel = bot.get_channel(ALERT_CHANNEL_ID)
-                if channel:
-                    alert_embed = discord.Embed(
-                        title=f"{E_WARN} SECURITY BREACH: CRYPTO-MINING PROCESS INTERCEPTED",
-                        description=f"{E_LIGHTNING} Unauthorized daemon intercepted on **{NODE_NAME}**.\n"
-                                    f"The container and storage volumes were instantly purged without warning.",
-                        color=0xED4245,
-                        timestamp=datetime.datetime.now(datetime.timezone.utc)
-                    )
-                    alert_embed.add_field(name=f"{E_CROWN} Offending User", value=f"<@{owner_id}> (`{owner_id}`)", inline=True)
-                    alert_embed.add_field(name=f"{E_INFO} Container ID", value=f"`{container_id[:16]}`", inline=True)
-                    alert_embed.add_field(name=f"{E_FIRE} Binary Signature", value=f"`{detected_miner}`", inline=True)
-                    alert_embed.set_footer(text=f"{NODE_NAME} Automated Security Firewall {E_BOT_TAG}", icon_url=bot.user.display_avatar.url)
-
-                    await channel.send(
-                        content=f"<@{MINING_ALERT_PING_ID}> {E_WARN} **EMERGENCY INCIDENT REPORT**",
-                        embed=alert_embed
-                    )
-
-                target_user = bot.get_user(owner_id)
-                if target_user:
-                    try:
-                        dm_embed = discord.Embed(
-                            title=f"{E_NO} INSTANCE PURGED - TERMS OF SERVICE VIOLATION",
-                            description=f"Your virtual machine on **{NODE_NAME}** was terminated immediately.\n\n"
-                                        f"**Violation:** Cryptomining activity (`{detected_miner}`) is strictly forbidden across our infrastructure.",
-                            color=0xED4245
-                        )
-                        dm_embed.set_footer(text=f"{NODE_NAME} Security Operations")
-                        await target_user.send(embed=dm_embed)
-                    except discord.Forbidden:
-                        pass
-
-        except docker.errors.NotFound:
-            continue
-        except Exception as e:
-            print(f"Sentinel error on VM {owner_id}: {e}")
-
-# ----------------- EXPIRY MONITOR LOOP -----------------
-@tasks.loop(minutes=30)
-async def expiry_check_loop():
-    now = datetime.datetime.now(datetime.timezone.utc)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT owner_id, expires_at FROM vms") as cur:
-            vms = await cur.fetchall()
-
-        for owner_id, exp_str in vms:
-            try:
-                exp_dt = datetime.datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=datetime.timezone.utc)
-                if now >= exp_dt:
-                    c_name = f"nova-vm-{owner_id}"
-                    try:
-                        docker_client.containers.get(c_name).remove(force=True)
-                    except Exception:
-                        pass
-                    await db.execute("DELETE FROM vms WHERE owner_id = ?", (owner_id,))
-                    await db.commit()
-                    
-                    user = bot.get_user(owner_id)
-                    if user:
-                        try:
-                            await user.send(f"{E_WARN} Your virtual machine lease on **{NODE_NAME}** has expired and was removed.")
-                        except Exception:
-                            pass
-            except Exception as e:
-                print(f"Error handling lease expiry for {owner_id}: {e}")
-
-if __name__ == "__main__":
-    bot.run(TOKEN)
+            # 3. Update loading popup embed to SUCCESS
+            succ
