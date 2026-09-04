@@ -14,7 +14,7 @@ from typing import Optional
 # ----------------- CONFIGURATION -----------------
 TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
 NODE_NAME = "TEMPEST NODE"
-HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Public IP or domain for SSH/VNC access
+HOST_IP = "YOUR_SERVER_PUBLIC_IP"  # Replace with public IP/Domain
 DB_PATH = "tempest_vms.db"
 
 # Main Owner & Server Admin ID (Full Bypass + Reactions)
@@ -177,52 +177,59 @@ def execute_tmate_session(container_name: str) -> str:
     # 1. Terminate old tmate sessions and stale sockets
     container.exec_run("sh -c 'pkill -9 tmate; rm -f /tmp/tmate.sock'")
 
-    # 2. Universal installer: handles apk (Alpine), apt-get (Debian/Ubuntu), or direct static binary download
-    install_script = """
-    if ! command -v tmate >/dev/null 2>&1; then
-        if command -v apk >/dev/null 2>&1; then
-            apk update && apk add --no-cache tmate openssh-client curl tar xz
-        elif command -v apt-get >/dev/null 2>&1; then
-            DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends tmate openssh-client curl tar xz-utils
-        else
-            ARCH=$(uname -m)
-            URL=""
-            if [ "$ARCH" = "x86_64" ]; then
-                URL="https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz"
-            elif [ "$ARCH" = "aarch64" ]; then
-                URL="https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-arm64v8.tar.xz"
-            fi
-            
-            mkdir -p /tmp/tmate_dl
-            if command -v curl >/dev/null 2>&1; then
-                curl -sL "$URL" | tar -xJ -C /tmp/tmate_dl --strip-components=1
-            elif command -v wget >/dev/null 2>&1; then
-                wget -qO- "$URL" | tar -xJ -C /tmp/tmate_dl --strip-components=1
-            fi
-            
-            if [ -f /tmp/tmate_dl/tmate ]; then
-                mv /tmp/tmate_dl/tmate /usr/local/bin/tmate
-                chmod +x /usr/local/bin/tmate
-                rm -rf /tmp/tmate_dl
-            fi
-        fi
-    fi
-    """
-    
-    inst_res = container.exec_run(f"sh -c '{install_script}'")
-    
+    # 2. Check if tmate binary exists
     check = container.exec_run("sh -c 'command -v tmate'")
     if check.exit_code != 0:
-        raise RuntimeError(f"Could not setup tmate inside container: {inst_res.output.decode('utf-8', errors='ignore')[:150]}")
+        # Pull static binary directly (bypasses broken APK mirror endpoints)
+        download_script = """
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "x86_64" ]; then
+            URL="https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz"
+        elif [ "$ARCH" = "aarch64" ]; then
+            URL="https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-arm64v8.tar.xz"
+        else
+            echo "Unsupported architecture: $ARCH" && exit 1
+        fi
+
+        mkdir -p /tmp/tmate_dl
+        if command -v curl >/dev/null 2>&1; then
+            curl -k -sL "$URL" -o /tmp/tmate_dl/tmate.tar.xz
+        elif command -v wget >/dev/null 2>&1; then
+            wget --no-check-certificate -q "$URL" -O /tmp/tmate_dl/tmate.tar.xz
+        else
+            echo "No download tool found" && exit 1
+        fi
+
+        tar -xJf /tmp/tmate_dl/tmate.tar.xz -C /tmp/tmate_dl --strip-components=1 2>/dev/null || \
+        tar -xf /tmp/tmate_dl/tmate.tar.xz -C /tmp/tmate_dl --strip-components=1 2>/dev/null
+
+        if [ -f /tmp/tmate_dl/tmate ]; then
+            mv /tmp/tmate_dl/tmate /usr/bin/tmate || mv /tmp/tmate_dl/tmate /usr/local/bin/tmate
+            chmod +x /usr/bin/tmate /usr/local/bin/tmate 2>/dev/null
+            rm -rf /tmp/tmate_dl
+            exit 0
+        else
+            exit 1
+        fi
+        """
+        dl_res = container.exec_run(f"sh -c '{download_script}'")
+
+        check = container.exec_run("sh -c 'command -v tmate'")
+        if check.exit_code != 0:
+            apk_fallback = container.exec_run("sh -c 'apk add --no-cache --timeout 15 tmate 2>&1'")
+            check = container.exec_run("sh -c 'command -v tmate'")
+            if check.exit_code != 0:
+                err_msg = dl_res.output.decode('utf-8', errors='ignore') + " | " + apk_fallback.output.decode('utf-8', errors='ignore')
+                raise RuntimeError(f"Could not setup tmate: {err_msg[:140]}")
 
     # 3. Launch tmate in background with dedicated socket
     launch_res = container.exec_run("sh -c 'tmate -S /tmp/tmate.sock -F new-session -d'")
     if launch_res.exit_code != 0:
         raise RuntimeError("Failed to spawn background tmate session.")
 
-    # 4. Wait for tmate server connection to initialize
+    # 4. Wait for tmate connection to initialize
     ready = False
-    for _ in range(12):
+    for _ in range(15):
         w = container.exec_run("sh -c 'tmate -S /tmp/tmate.sock wait tmate-ready'")
         if w.exit_code == 0:
             ready = True
@@ -324,7 +331,6 @@ class VMControlView(discord.ui.View):
         self.reinstall_button.custom_id = f"nova_reinstall_{self.owner_id}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Full bypass for Main Owner and configured admins
         user_is_admin = await is_admin(interaction.user.id)
         if interaction.user.id == self.owner_id or user_is_admin:
             return True
@@ -673,7 +679,7 @@ async def vinfo_prefix(ctx):
     embed.add_field(
         name=f"{E_GEAR} DDR5 ECC Registered Memory",
         value=f"{E_ARROW} **Allocated/Total:** `42.8 GB / 500.0 GB` (8.5%)\n"
-              f"{E_ARROW} **Available Buffer:** `457.2 GB Free`\n"
+              f"{E_ARROW} **Free Buffer:** `457.2 GB Free`\n"
               f"{E_ARROW} **Utilization:** [██░░░░░░░░░░░░░░░░░░]",
         inline=False
     )
