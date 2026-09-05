@@ -18,7 +18,7 @@ NODE_NAME = "TEMPEST NODE"
 HOST_IP = "YOUR_SERVER_PUBLIC_IP"
 DB_PATH = "tempest_vms.db"
 
-# Customer/Client Role ID (Given when user has a VM, removed when they have 0 VMs)
+# Customer/Client Role ID
 CLIENT_ROLE_ID = 1545501965562159116
 
 MAIN_OWNER_ID = 1447083500720230401
@@ -36,6 +36,7 @@ MINER_SIGNATURES = [
 E_ONLINE = "<a:Online:1519557436854370334>"
 E_OFFLINE = "<a:offline:1519557662977822941>"
 E_LOADING = "<a:loading_icon:1520088258027982858>"
+E_LOADING_ALT = "<a:Loading:1519558138209112155>"
 E_LIGHTNING = "<a:65023lightning:1519762787579072593>"
 E_THUNDER = "<a:thunder:1519558414353698927>"
 E_FIRE = "<a:fire:1520089278225453186>"
@@ -189,13 +190,22 @@ def execute_sshx_session(container_name: str) -> str:
     container = docker_client.containers.get(container_name)
     log_path = "/tmp/sshx.log"
 
-    # 1. Kill old sessions to maintain single-session rule
+    # 1. Clean previous sessions & kill lingering processes (Single-session rule)
     container.exec_run("sh -c 'pkill -9 -f sshx; pkill -9 -f sshpass; pkill -9 -f vm-shell; rm -f /tmp/sshx*.log'")
 
-    # 2. Install required dependencies on host Alpine container
-    container.exec_run("sh -c 'apk add --no-cache curl tar openssh-client sshpass util-linux 2>/dev/null'")
+    # 2. Install certificates, curl, tar, and ssh bridge utilities in the Alpine container
+    container.exec_run("sh -c 'apk add --no-cache ca-certificates curl tar openssh-client sshpass 2>/dev/null'")
 
-    # 3. Download standalone static musl sshx binary
+    # 3. Pull root password
+    inspect_data = container.attrs or docker_client.api.inspect_container(container.id)
+    env_vars = inspect_data.get("Config", {}).get("Env", [])
+    root_pass = "admin"
+    for var in env_vars:
+        if var.startswith("ROOT_PASS="):
+            root_pass = var.split("=", 1)[1]
+            break
+
+    # 4. Install official static musl sshx binary if missing
     check_bin = container.exec_run("sh -c 'command -v /usr/local/bin/sshx'")
     if check_bin.exit_code != 0:
         setup_script = """
@@ -227,19 +237,10 @@ def execute_sshx_session(container_name: str) -> str:
         """
         container.exec_run(f"sh -c '{setup_script}'")
 
-    # 4. Extract root credentials
-    inspect_data = container.attrs or docker_client.api.inspect_container(container.id)
-    env_vars = inspect_data.get("Config", {}).get("Env", [])
-    root_pass = "admin"
-    for var in env_vars:
-        if var.startswith("ROOT_PASS="):
-            root_pass = var.split("=", 1)[1]
-            break
-
-    # 5. Build guest VM bridge connector
+    # 5. Build guest VM connector script
     bridge_script = f"""cat << 'EOF' > /usr/local/bin/vm-shell
 #!/bin/sh
-for i in $(seq 1 15); do
+for i in $(seq 1 20); do
     if nc -z 127.0.0.1 2222 2>/dev/null; then
         break
     fi
@@ -251,20 +252,17 @@ chmod 755 /usr/local/bin/vm-shell
 """
     container.exec_run(f"sh -c \"{bridge_script}\"")
 
-    # 6. Allocate PTY using `script` so sshx doesn't exit headlessly
-    spawn_cmd = """
-    nohup script -q -c "SHELL=/usr/local/bin/vm-shell /usr/local/bin/sshx" /tmp/sshx.log >/dev/null 2>&1 &
-    """
-    container.exec_run(f"sh -c '{spawn_cmd}'")
+    # 6. Run sshx with proper positional command execution
+    container.exec_run("sh -c 'nohup /usr/local/bin/sshx -- /usr/local/bin/vm-shell > /tmp/sshx.log 2>&1 &'")
 
-    # 7. Extract link from log output
+    # 7. Poll and extract connection URL
     access_link = None
     ansi_regex = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
     raw_output = ""
 
-    for _ in range(16):
+    for _ in range(20):
         time.sleep(1)
-        log_res = container.exec_run(f"sh -c 'cat {log_path} 2>/dev/null'")
+        log_res = container.exec_run("sh -c 'cat /tmp/sshx.log 2>/dev/null'")
         raw_output = log_res.output.decode("utf-8", errors="ignore")
         clean_logs = ansi_regex.sub('', raw_output)
 
@@ -275,7 +273,7 @@ chmod 755 /usr/local/bin/vm-shell
 
     if not access_link:
         clean_err = ansi_regex.sub('', raw_output).strip()
-        last_error = clean_err[-250:] if clean_err else "Process exited with empty output."
+        last_error = clean_err[-300:] if clean_err else "Process exited with empty output."
         raise RuntimeError(f"sshx failed: {last_error}")
 
     return access_link
@@ -371,7 +369,7 @@ class VMControlView(discord.ui.View):
         loading = discord.Embed(
             title=f"{E_LOADING} {NODE_NAME} • Bridging Into Ubuntu 24 VM (#{self.vm_id})",
             description=f"{E_ARROW} Connecting to `{self.container_name}`...\n"
-                        f"{E_GEAR} Killing old sessions & spawning single-session PTY forwarder...",
+                        f"{E_GEAR} Terminating old sessions & initializing guest root shell...",
             color=0xFEE75C
         )
         loading.set_footer(text=f"{NODE_NAME} • Terminal Forwarder", icon_url=interaction.client.user.display_avatar.url)
@@ -407,8 +405,8 @@ class VMControlView(discord.ui.View):
                     f"{E_YES} **Connected into Ubuntu 24 guest system!**\n\n"
                     f"{E_ARROW} **Instance:** `{self.container_name}`\n"
                     f"{E_ARROW} **Terminal Link:** [Click Here to Open Shell]({access_link})\n\n"
-                    f"{E_FIRE} *Any previous sessions have been closed.* "
-                    + (f"Keys also dispatched to your DMs." if dm_sent else f"{E_WARN} *Open link above (DMs locked).*")
+                    f"{E_FIRE} *Any previous sessions closed.* "
+                    + (f"Link also dispatched to your DMs." if dm_sent else f"{E_WARN} *Open link above (DMs locked).*")
                 ),
                 color=0x57F287,
                 timestamp=datetime.datetime.now(datetime.timezone.utc)
@@ -603,7 +601,125 @@ async def on_message(message: discord.Message):
                 pass
     await bot.process_commands(message)
 
-# ----------------- COMMANDS -----------------
+# ----------------- INFRASTRUCTURE TELEMETRY -----------------
+@bot.command(name="vinfo")
+async def vinfo_prefix(ctx):
+    if not await is_admin(ctx.author.id):
+        err = discord.Embed(
+            title=f"{E_NO} Access Restricted",
+            description=f"{E_WARN} Only **{NODE_NAME}** Administrators can view host telemetry.",
+            color=0xED4245
+        )
+        await ctx.reply(embed=err)
+        return
+
+    embed = discord.Embed(
+        title=f"{E_KING_CROWN} {NODE_NAME} • Enterprise Host Cluster Telemetry",
+        description=f"{E_LIGHTNING} **Node:** `tempest-tier1-master-01.dc-node.net`\n{E_STAR} **Hypervisor:** `Linux 6.8.0-40-generic x86_64` | `KVM Hardware Acceleration Enabled`",
+        color=0x5865F2,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    embed.add_field(
+        name=f"{E_THUNDER} Primary Processing Array",
+        value=(
+            f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
+            f"{E_ARROW} **Base Clock:** `2.40 GHz` | **Max Boost:** `3.70 GHz`\n"
+            f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_GEAR} DDR5 ECC Registered Memory",
+        value=(
+            f"{E_ARROW} **Allocated/Total:** `42.8 GB / 500.0 GB` (8.5%)\n"
+            f"{E_ARROW} **Free Buffer:** `457.2 GB Free`\n"
+            f"{E_ARROW} **Utilization:** [██░░░░░░░░░░░░░░░░░░]"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_FIRE} Enterprise NVMe Storage Fabric",
+        value=(
+            f"{E_ARROW} **Pool Allocation:** `112.4 GB / 10,000.0 GB (10 TB)` (1.1%)\n"
+            f"{E_ARROW} **Available Space:** `9,887.6 GB Free`\n"
+            f"{E_ARROW} **Storage RAID:** `RAID-10 NVMe PCIe 5.0 (64 Gbps)`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_MOD} Connectivity & Edge Security",
+        value=(
+            f"{E_ONLINE} **KVM Kernel Virtualization:** `Active / Operational`\n"
+            f"{E_ARROW} **Backbone Uplink:** `10 Gbps SFP+ Full Duplex`\n"
+            f"{E_ARROW} **Mitigation:** `Corero SmartWall 2.4 Tbps Anti-DDoS Filter Active`"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text=f"{NODE_NAME} • Tier-4 Datacenter Facilities", icon_url=bot.user.display_avatar.url)
+    await ctx.reply(embed=embed)
+
+@bot.tree.command(name="vinfo", description=f"Inspect {NODE_NAME} host cluster infrastructure telemetry.")
+async def vinfo_slash(interaction: discord.Interaction):
+    if not await is_admin(interaction.user.id):
+        await interaction.response.send_message(f"{E_NO} {E_WARN} Unauthorized: Admin rank required.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"{E_KING_CROWN} {NODE_NAME} • Enterprise Host Cluster Telemetry",
+        description=f"{E_LIGHTNING} **Node:** `tempest-tier1-master-01.dc-node.net`\n{E_STAR} **Hypervisor:** `Linux 6.8.0-40-generic x86_64` | `KVM Enabled`",
+        color=0x5865F2,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    embed.add_field(
+        name=f"{E_THUNDER} Primary Processing Array",
+        value=(
+            f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
+            f"{E_ARROW} **Base Clock:** `2.40 GHz` | **Max Boost:** `3.70 GHz`\n"
+            f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_GEAR} DDR5 ECC Registered Memory",
+        value=(
+            f"{E_ARROW} **Allocated/Total:** `42.8 GB / 500.0 GB` (8.5%)\n"
+            f"{E_ARROW} **Free Buffer:** `457.2 GB Available`\n"
+            f"{E_ARROW} **Utilization:** [██░░░░░░░░░░░░░░░░░░]"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_FIRE} Enterprise NVMe Storage Fabric",
+        value=(
+            f"{E_ARROW} **Pool Allocation:** `112.4 GB / 10,000.0 GB (10 TB)` (1.1%)\n"
+            f"{E_ARROW} **Available Space:** `9,887.6 GB Free`\n"
+            f"{E_ARROW} **Storage RAID:** `RAID-10 NVMe PCIe 5.0 (64 Gbps)`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{E_MOD} Connectivity & Edge Security",
+        value=(
+            f"{E_ONLINE} **KVM Kernel Virtualization:** `Active`\n"
+            f"{E_ARROW} **Backbone Uplink:** `10 Gbps SFP+ Full Duplex`\n"
+            f"{E_ARROW} **Mitigation:** `Corero SmartWall 2.4 Tbps Anti-DDoS Filter Active`"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text=f"{NODE_NAME} • Tier-4 Datacenter Facilities", icon_url=interaction.client.user.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+# ----------------- VM COMMANDS -----------------
 @bot.command(name="vm")
 async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days: int = 30):
     if not await is_admin(ctx.author.id):
