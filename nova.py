@@ -252,8 +252,8 @@ chmod 755 /usr/local/bin/vm-shell
 """
     container.exec_run(f"sh -c \"{bridge_script}\"")
 
-    # 6. Run sshx with proper positional command execution
-    container.exec_run("sh -c 'nohup /usr/local/bin/sshx -- /usr/local/bin/vm-shell > /tmp/sshx.log 2>&1 &'")
+    # 6. Run sshx with NO trailing arguments, passing custom shell via SHELL env var
+    container.exec_run("sh -c 'nohup env SHELL=/usr/local/bin/vm-shell /usr/local/bin/sshx > /tmp/sshx.log 2>&1 &'")
 
     # 7. Poll and extract connection URL
     access_link = None
