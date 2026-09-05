@@ -36,38 +36,25 @@ MINER_SIGNATURES = [
 E_ONLINE = "<a:Online:1519557436854370334>"
 E_OFFLINE = "<a:offline:1519557662977822941>"
 E_LOADING = "<a:loading_icon:1520088258027982858>"
-E_LOADING_ALT = "<a:Loading:1519558138209112155>"
 E_LIGHTNING = "<a:65023lightning:1519762787579072593>"
 E_THUNDER = "<a:thunder:1519558414353698927>"
 E_FIRE = "<a:fire:1520089278225453186>"
 E_GEAR = "<a:PurpleGear:1545024403216269395>"
-E_GEAR_ALT = "<a:PurpleGear:1545024721266024600>"
-E_WAVES = "<a:waves:1520088703811326122>"
-
 E_YES = "<a:yes:1519555946312106024>"
 E_CHECK = "<a:greencheck:1519588992767496193>"
-E_VOTE_YES = "<a:vote_yes:1519763256992993422>"
 E_NO = "<a:vote_no:1519763086570164246>"
 E_WARN = "<a:Warning:1519588395620499648>"
 E_DOWN = "<a:DOWN:1520088811399413850>"
-
 E_ARROW = "<a:arrow:1519556344951341156>"
 E_ARROW_DOUBLE = "<a:arrow:1519556677173510325>"
 E_LEFT_ARROW = "<a:leftarrow:1519585449713074226>"
 E_STAR = "<a:star:1519557024801751051>"
 E_BLACK_WING = "<a:blackWing1:1545024935016144947>"
-E_HARK = "<a:hark:1545025229846220830>"
-E_REACT = "<:react:1519765808023076946>"
-E_GG = "<a:GG:1519587770425933824>"
-
-E_CROWN = "<:1_crown:1519585072687222936>"
 E_KING_CROWN = "<a:King_crown:1519766073560403990>"
 E_MOD = "<:ModeratorRoleIcon:1545029625405505586>"
-E_HEADMOD = "<:headmod:1519766736423878936>"
-E_PROFILE = "<:profil:1520088044970180638>"
 E_BOT_TAG = "<:bot_tag:1519559016013889647>"
-E_CLYDE = "<:clyde_bot:1539693513837514885>"
 E_INFO = "<:Information:1545028101501747230>"
+E_GG = "<a:GG:1519587770425933824>"
 
 OWNER_REACTIONS = [
     "arrow:1519556677173510325",
@@ -130,19 +117,17 @@ def get_free_port(base_start: int):
 
 # ----------------- ROLE SYNC HELPERS -----------------
 async def grant_client_role(user_id: int):
-    """Gives the client role to the user across all mutual guilds."""
     for guild in bot.guilds:
         member = guild.get_member(user_id)
         if member:
             role = guild.get_role(CLIENT_ROLE_ID)
             if role and role not in member.roles:
                 try:
-                    await member.add_roles(role, reason="Assigned active Virtual Machine")
+                    await member.add_roles(role, reason="Assigned active VM")
                 except Exception:
                     pass
 
 async def revoke_client_role_if_empty(user_id: int):
-    """Removes the client role if the user has 0 remaining active VMs."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM vms WHERE owner_id = ?", (user_id,)) as cur:
             count = (await cur.fetchone())[0]
@@ -154,7 +139,7 @@ async def revoke_client_role_if_empty(user_id: int):
                 role = guild.get_role(CLIENT_ROLE_ID)
                 if role and role in member.roles:
                     try:
-                        await member.remove_roles(role, reason="All Virtual Machines terminated/expired")
+                        await member.remove_roles(role, reason="All VMs terminated")
                     except Exception:
                         pass
 
@@ -204,14 +189,14 @@ def execute_sshx_session(container_name: str) -> str:
     container = docker_client.containers.get(container_name)
     log_path = "/tmp/sshx.log"
 
-    # 1. KILL ALL OLD SESSIONS (Single-Session Rule: terminate previous sshx and bridges)
+    # 1. Kill old sessions to maintain single-session rule
     container.exec_run("sh -c 'pkill -9 -f sshx; pkill -9 -f sshpass; pkill -9 -f vm-shell; rm -f /tmp/sshx*.log'")
 
-    # 2. Check and install dependencies in outer layer
-    container.exec_run("sh -c 'command -v sshpass >/dev/null 2>&1 || (apk add --no-cache sshpass openssh-client curl 2>/dev/null)'")
+    # 2. Install required dependencies on host Alpine container
+    container.exec_run("sh -c 'apk add --no-cache curl tar openssh-client sshpass util-linux 2>/dev/null'")
 
-    # 3. Check and download standalone sshx binary if missing
-    check_bin = container.exec_run("sh -c 'command -v /usr/local/bin/sshx || command -v sshx'")
+    # 3. Download standalone static musl sshx binary
+    check_bin = container.exec_run("sh -c 'command -v /usr/local/bin/sshx'")
     if check_bin.exit_code != 0:
         setup_script = """
         ARCH=$(uname -m)
@@ -224,17 +209,25 @@ def execute_sshx_session(container_name: str) -> str:
 
         if [ -n "$URL" ]; then
             mkdir -p /tmp/sshx_dl
-            curl -k -fsSL "$URL" | tar -xz -C /tmp/sshx_dl 2>/dev/null
+            curl -fsSL "$URL" | tar -xz -C /tmp/sshx_dl 2>/dev/null
             if [ -f /tmp/sshx_dl/sshx ]; then
                 mv /tmp/sshx_dl/sshx /usr/local/bin/sshx
-                chmod +x /usr/local/bin/sshx
+                chmod 755 /usr/local/bin/sshx
                 rm -rf /tmp/sshx_dl
+            fi
+        fi
+
+        if ! command -v /usr/local/bin/sshx >/dev/null 2>&1; then
+            curl -sSf https://sshx.io/get | sh 2>/dev/null
+            if [ -f /root/.sshx/sshx ]; then
+                mv /root/.sshx/sshx /usr/local/bin/sshx
+                chmod 755 /usr/local/bin/sshx
             fi
         fi
         """
         container.exec_run(f"sh -c '{setup_script}'")
 
-    # 4. Read container root password
+    # 4. Extract root credentials
     inspect_data = container.attrs or docker_client.api.inspect_container(container.id)
     env_vars = inspect_data.get("Config", {}).get("Env", [])
     root_pass = "admin"
@@ -243,35 +236,37 @@ def execute_sshx_session(container_name: str) -> str:
             root_pass = var.split("=", 1)[1]
             break
 
-    # 5. Setup internal bridge script targeting guest Ubuntu 24 VM
+    # 5. Build guest VM bridge connector
     bridge_script = f"""cat << 'EOF' > /usr/local/bin/vm-shell
 #!/bin/sh
-while ! nc -z 127.0.0.1 2222 2>/dev/null; do
-    echo "Waiting for Ubuntu 24 VM to initialize..."
+for i in $(seq 1 15); do
+    if nc -z 127.0.0.1 2222 2>/dev/null; then
+        break
+    fi
     sleep 1
 done
-exec sshpass -p '{root_pass}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 -p 2222
+exec sshpass -p '{root_pass}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@127.0.0.1
 EOF
-chmod +x /usr/local/bin/vm-shell
+chmod 755 /usr/local/bin/vm-shell
 """
     container.exec_run(f"sh -c \"{bridge_script}\"")
 
-    # 6. Spawn the single new session
-    spawn_cmd = f"""
-    BIN="$(command -v /usr/local/bin/sshx || command -v sshx)"
-    nohup "$BIN" -s /usr/local/bin/vm-shell > {log_path} 2>&1 &
+    # 6. Allocate PTY using `script` so sshx doesn't exit headlessly
+    spawn_cmd = """
+    nohup script -q -c "SHELL=/usr/local/bin/vm-shell /usr/local/bin/sshx" /tmp/sshx.log >/dev/null 2>&1 &
     """
     container.exec_run(f"sh -c '{spawn_cmd}'")
 
-    # 7. Extract the unique session link
+    # 7. Extract link from log output
     access_link = None
-    ansi_regex = re.compile(r'\x1b\[[0-9;]*m')
+    ansi_regex = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+    raw_output = ""
 
-    for _ in range(15):
+    for _ in range(16):
         time.sleep(1)
         log_res = container.exec_run(f"sh -c 'cat {log_path} 2>/dev/null'")
-        raw_logs = log_res.output.decode("utf-8", errors="ignore")
-        clean_logs = ansi_regex.sub('', raw_logs)
+        raw_output = log_res.output.decode("utf-8", errors="ignore")
+        clean_logs = ansi_regex.sub('', raw_output)
 
         match = re.search(r'https://sshx\.io/s/[a-zA-Z0-9#-_]+', clean_logs)
         if match:
@@ -279,7 +274,9 @@ chmod +x /usr/local/bin/vm-shell
             break
 
     if not access_link:
-        raise RuntimeError("Failed to bind new single-session sshx tunnel.")
+        clean_err = ansi_regex.sub('', raw_output).strip()
+        last_error = clean_err[-250:] if clean_err else "Process exited with empty output."
+        raise RuntimeError(f"sshx failed: {last_error}")
 
     return access_link
 
@@ -322,12 +319,12 @@ async def dispatch_private_credentials(user: discord.User, data: tuple, is_admin
     embed = discord.Embed(
         title=f"{E_KING_CROWN} {NODE_NAME} • Private Keys (VM #{vm_id})",
         description=f"{E_STAR} **Confidential Credentials for `{c_name}`**\n"
-                    f"{E_WARN} *Do not share these keys. Only you and Administrators have access.*",
+                    f"{E_WARN} *Do not share these keys.*",
         color=0xFEE75C,
         timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
     embed.add_field(
-        name=f"{E_FIRE} Authorization & Secret Passwords",
+        name=f"{E_FIRE} Authorization & Passwords",
         value=(
             f"{E_ARROW} **Direct SSH:** `ssh root@{HOST_IP} -p {ssh_port}`\n"
             f"{E_ARROW} **Root Password:** `{root_pass}`\n"
@@ -348,7 +345,7 @@ async def dispatch_private_credentials(user: discord.User, data: tuple, is_admin
     embed.set_footer(text=footer, icon_url=bot.user.display_avatar.url)
     await user.send(embed=embed)
 
-# ----------------- UI CONTROLS & DROPDOWN -----------------
+# ----------------- UI VIEWS -----------------
 class VMControlView(discord.ui.View):
     def __init__(self, vm_id: int, owner_id: int, container_name: str):
         super().__init__(timeout=None)
@@ -371,31 +368,29 @@ class VMControlView(discord.ui.View):
 
     @discord.ui.button(label="Generate SSH (SSHX)", style=discord.ButtonStyle.primary, emoji="⚡")
     async def ssh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 1. Loading Embed Process
         loading = discord.Embed(
             title=f"{E_LOADING} {NODE_NAME} • Bridging Into Ubuntu 24 VM (#{self.vm_id})",
             description=f"{E_ARROW} Connecting to `{self.container_name}`...\n"
-                        f"{E_GEAR} Killing old sessions & spawning new single-session forwarder...",
+                        f"{E_GEAR} Killing old sessions & spawning single-session PTY forwarder...",
             color=0xFEE75C
         )
-        loading.set_footer(text=f"{NODE_NAME} • Secure Terminal Core", icon_url=interaction.client.user.display_avatar.url)
+        loading.set_footer(text=f"{NODE_NAME} • Terminal Forwarder", icon_url=interaction.client.user.display_avatar.url)
         await interaction.response.send_message(embed=loading, ephemeral=True)
         loop = asyncio.get_running_loop()
 
         try:
-            # 2. Kill old session and launch only one new session
             access_link = await loop.run_in_executor(None, execute_sshx_session, self.container_name)
 
             dm_embed = discord.Embed(
-                title=f"{E_LIGHTNING} {NODE_NAME} • Ubuntu 24 Shell (VM #{self.vm_id})",
+                title=f"{E_LIGHTNING} {NODE_NAME} • Ubuntu 24 Root Shell (VM #{self.vm_id})",
                 description=f"{E_STAR} Dedicated root bridge established for `{self.container_name}`.\n"
-                            f"{E_WARN} *All previous shell sessions were terminated. Only this link is live.*",
+                            f"{E_WARN} *All former background sessions terminated. Only this link is live.*",
                 color=0x5865F2,
                 timestamp=datetime.datetime.now(datetime.timezone.utc)
             )
             dm_embed.add_field(
                 name=f"{E_GEAR} Direct Web Shell Link",
-                value=f"{E_ARROW} **URL:**\n{access_link}\n\n{E_FIRE} *Full root privileges and `apt` commands are ready to use.*",
+                value=f"{E_ARROW} **URL:**\n{access_link}\n\n{E_FIRE} *Full root privileges and `apt` commands are ready.*",
                 inline=False
             )
             dm_embed.set_footer(text=f"{NODE_NAME} • Single-Session Bridge", icon_url=interaction.client.user.display_avatar.url)
@@ -406,15 +401,14 @@ class VMControlView(discord.ui.View):
             except discord.Forbidden:
                 dm_sent = False
 
-            # 3. Success Embed Process
             success = discord.Embed(
                 title=f"{E_CHECK} {NODE_NAME} • Terminal Generated (VM #{self.vm_id})",
                 description=(
                     f"{E_YES} **Connected into Ubuntu 24 guest system!**\n\n"
                     f"{E_ARROW} **Instance:** `{self.container_name}`\n"
                     f"{E_ARROW} **Terminal Link:** [Click Here to Open Shell]({access_link})\n\n"
-                    f"{E_FIRE} *Any older sessions have been cleanly killed.* "
-                    + (f"Keys also dispatched to your DMs." if dm_sent else f"{E_WARN} *Please open link above (DMs closed).*")
+                    f"{E_FIRE} *Any previous sessions have been closed.* "
+                    + (f"Keys also dispatched to your DMs." if dm_sent else f"{E_WARN} *Open link above (DMs locked).*")
                 ),
                 color=0x57F287,
                 timestamp=datetime.datetime.now(datetime.timezone.utc)
@@ -422,14 +416,12 @@ class VMControlView(discord.ui.View):
             success.set_footer(text=f"{NODE_NAME} • Hypervisor Core", icon_url=interaction.client.user.display_avatar.url)
             await interaction.edit_original_response(embed=success)
         except Exception as e:
-            # 4. Failure Embed Process
             fail = discord.Embed(
                 title=f"{E_NO} {NODE_NAME} • Bridge Error",
                 description=f"{E_WARN} **Failed to connect terminal:**\n\n```{str(e)}```",
-                color=0xED4245,
-                timestamp=datetime.datetime.now(datetime.timezone.utc)
+                color=0xED4245
             )
-            fail.set_footer(text=f"{NODE_NAME} • Diagnostic", icon_url=interaction.client.user.display_avatar.url)
+            fail.set_footer(text=f"{NODE_NAME} • Operations Diagnostic", icon_url=interaction.client.user.display_avatar.url)
             await interaction.edit_original_response(embed=fail)
 
     @discord.ui.button(label="View Passwords (DM)", style=discord.ButtonStyle.secondary, emoji="🔑")
@@ -445,13 +437,12 @@ class VMControlView(discord.ui.View):
 
         try:
             await dispatch_private_credentials(interaction.user, data, is_admin_viewer=(interaction.user.id != self.owner_id))
-            await interaction.followup.send(f"{E_CHECK} Passwords dispatched to your DMs.", ephemeral=True)
+            await interaction.followup.send(f"{E_CHECK} Passwords sent to your DMs.", ephemeral=True)
         except discord.Forbidden:
-            await interaction.followup.send(f"{E_WARN} Could not DM you. Please enable direct messages.", ephemeral=True)
+            await interaction.followup.send(f"{E_WARN} Cannot DM you. Please enable direct messages.", ephemeral=True)
 
     @discord.ui.button(label="Reinstall", style=discord.ButtonStyle.danger, emoji="🔄")
     async def reinstall_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 1. Loading Embed Process
         loading = discord.Embed(
             title=f"{E_LOADING} {NODE_NAME} • Reinstalling Operating System",
             description=f"{E_ARROW} Re-imaging root disk volume for `{self.container_name}`...\n"
@@ -484,7 +475,6 @@ class VMControlView(discord.ui.View):
                 await db.execute("UPDATE vms SET container_id = ? WHERE vm_id = ?", (new_id, self.vm_id))
                 await db.commit()
 
-            # 2. Success Embed Process
             success = discord.Embed(
                 title=f"{E_CHECK} {NODE_NAME} • Reinstallation Completed",
                 description=(
@@ -499,7 +489,6 @@ class VMControlView(discord.ui.View):
             success.set_footer(text=f"{NODE_NAME} • Hypervisor Core", icon_url=interaction.client.user.display_avatar.url)
             await interaction.edit_original_response(embed=success)
         except Exception as e:
-            # 3. Failure Embed Process
             fail_embed = discord.Embed(
                 title=f"{E_NO} Reinstall Failed",
                 description=f"{E_WARN} Error re-imaging container: `{str(e)}`",
@@ -600,7 +589,7 @@ async def on_ready():
         
     expiry_check_loop.start()
     anti_mining_monitor.start()
-    print(f"Nova online on {NODE_NAME} (Multi-VM + Auto-Role Enabled)")
+    print(f"Nova online on {NODE_NAME} (Multi-VM + PTY sshx Fix Online)")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -614,7 +603,7 @@ async def on_message(message: discord.Message):
                 pass
     await bot.process_commands(message)
 
-# ----------------- VM COMMANDS -----------------
+# ----------------- COMMANDS -----------------
 @bot.command(name="vm")
 async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days: int = 30):
     if not await is_admin(ctx.author.id):
@@ -626,7 +615,6 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
         await ctx.reply(embed=err)
         return
 
-    # Process Embed 1: Initializing
     init_embed = discord.Embed(
         title=f"{E_LOADING} Initializing Virtual Machine Slice",
         description=f"{E_ARROW} Deploying hardware virtualization for {user.mention} on **{NODE_NAME}**...\n"
@@ -643,7 +631,6 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
         created_at = datetime.datetime.now(datetime.timezone.utc)
         expires_at = (created_at + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        # Reserve record in DB first to acquire auto-incrementing vm_id
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute("""
                 INSERT INTO vms (owner_id, container_name, container_id, vnc_port, ssh_port, ram, cpu, disk, root_pass, vnc_pass, created_at, expires_at)
@@ -665,7 +652,6 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
 
         full_data = (vm_id, user.id, c_name, cid, vnc_port, ssh_port, ram, cpu, disk, root_pass, vnc_pass, created_at.strftime("%Y-%m-%d %H:%M:%S UTC"), expires_at)
 
-        # Automatically assign Client Role upon VM creation
         await grant_client_role(user.id)
 
         try:
@@ -673,7 +659,6 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
         except discord.Forbidden:
             pass
 
-        # Process Embed 2: Finished & Panel Ready
         embed = await build_channel_vm_embed(user, full_data)
         view = VMControlView(vm_id, user.id, c_name)
         await status_msg.edit(embed=embed, view=view)
@@ -725,13 +710,11 @@ async def manage_vm(ctx, user: Optional[discord.User] = None):
         )
         await ctx.reply(embed=select_embed, view=picker)
 
-# Dual-purpose delete command with auto-role revocation
 @bot.command(name="delete")
 async def delete_vm(ctx, target: Union[int, discord.User]):
     if not await is_admin(ctx.author.id):
         return
 
-    # Delete Process Embed
     del_progress = discord.Embed(
         title=f"{E_LOADING} Processing Cluster Wipe",
         description=f"{E_ARROW} Terminating container instance and tearing down NVMe storage...",
@@ -740,7 +723,6 @@ async def delete_vm(ctx, target: Union[int, discord.User]):
     msg = await ctx.reply(embed=del_progress)
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Case A: Integer passed -> Delete specific VM ID
         if isinstance(target, int):
             async with db.execute("SELECT owner_id, container_name FROM vms WHERE vm_id = ?", (target,)) as cur:
                 row = await cur.fetchone()
@@ -767,7 +749,6 @@ async def delete_vm(ctx, target: Union[int, discord.User]):
             await db.execute("DELETE FROM vms WHERE vm_id = ?", (target,))
             await db.commit()
 
-            # Check if user has 0 VMs remaining; if so, remove client role
             await revoke_client_role_if_empty(owner_id)
 
             success = discord.Embed(
@@ -782,7 +763,6 @@ async def delete_vm(ctx, target: Union[int, discord.User]):
             )
             await msg.edit(embed=success)
 
-        # Case B: Discord User passed -> Delete ALL VMs owned by user
         elif isinstance(target, discord.User):
             async with db.execute("SELECT vm_id, container_name FROM vms WHERE owner_id = ?", (target.id,)) as cur:
                 rows = await cur.fetchall()
@@ -811,7 +791,6 @@ async def delete_vm(ctx, target: Union[int, discord.User]):
             await db.execute("DELETE FROM vms WHERE owner_id = ?", (target.id,))
             await db.commit()
 
-            # Remove client role because all VMs are gone
             await revoke_client_role_if_empty(target.id)
 
             success = discord.Embed(
@@ -927,7 +906,7 @@ async def remove_admin(ctx, target: discord.User):
     )
     await ctx.reply(embed=admin_embed)
 
-# ----------------- MONITORS WITH AUTO-ROLE REMOVAL -----------------
+# ----------------- MONITORS -----------------
 @tasks.loop(seconds=20)
 async def anti_mining_monitor():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -958,7 +937,6 @@ async def anti_mining_monitor():
                     await db.execute("DELETE FROM vms WHERE vm_id = ?", (vm_id,))
                     await db.commit()
 
-                # Revoke client role if all user's VMs are gone
                 await revoke_client_role_if_empty(owner_id)
 
                 channel = bot.get_channel(ALERT_CHANNEL_ID)
@@ -994,7 +972,6 @@ async def expiry_check_loop():
                     await db.execute("DELETE FROM vms WHERE vm_id = ?", (vm_id,))
                     await db.commit()
 
-                    # Automatically remove role if expired VM leaves user with 0 VMs
                     await revoke_client_role_if_empty(owner_id)
 
                     user = bot.get_user(owner_id)
